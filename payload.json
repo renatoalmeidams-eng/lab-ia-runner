@@ -1,0 +1,9 @@
+{
+  "nomeProjeto": "teste1",
+  "arquivos": [
+    {
+      "caminho": "src/App.jsx",
+      "codigo": "export default function App(){return <h1>Funcionou 🚀</h1>}"
+    }
+  ]
+}

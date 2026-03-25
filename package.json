@@ -1,0 +1,11 @@
+{
+  "name": "lab-runner",
+  "version": "1.0.0",
+  "main": "lab-runner.js",
+  "scripts": {
+    "start": "node lab-runner.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
