@@ -17,9 +17,9 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// 🔥 HEALTHCHECK ULTRA RÁPIDO
+// ✅ HEALTHCHECK LIMPO
 app.get("/", (req, res) => {
-  return res.status(200).send("OK");
+  return res.status(200).json({ ok: true });
 });
 
 // 🔁 RESET
@@ -51,7 +51,7 @@ async function executarTarefa(tarefa) {
 
 // 🔁 RUN
 app.post("/run", async (req, res) => {
-  res.json({ status: "processando" }); // responde IMEDIATO
+  res.status(200).json({ status: "ok" });
 
   try {
     await resetarTarefasTravadas();
@@ -65,7 +65,7 @@ app.post("/run", async (req, res) => {
   }
 });
 
-// 🔗 EXECUTAR
+// 🔗 EXECUTAR (CORRETO)
 app.post("/executar", async (req, res) => {
   return res.status(200).json({ ok: true });
 });
