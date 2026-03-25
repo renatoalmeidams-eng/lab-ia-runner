@@ -145,3 +145,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Runner online na porta ${PORT}`);
   console.log(`📡 SUPABASE_URL: ${SUPABASE_URL}`);
 });
+
+// deploy 20260325010630
