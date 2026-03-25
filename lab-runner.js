@@ -10,7 +10,6 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-// 🔐 Validação obrigatória
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("❌ FATAL: SUPABASE_URL e SUPABASE_KEY não configuradas");
   process.exit(1);
@@ -18,107 +17,60 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ─── Healthcheck ─────────────────────────────
+// 🔥 HEALTHCHECK ULTRA RÁPIDO
 app.get("/", (req, res) => {
-  res.json({ ok: true });
+  return res.status(200).send("OK");
 });
 
-// 🔁 RESET DE TAREFAS TRAVADAS
+// 🔁 RESET
 async function resetarTarefasTravadas() {
-  console.log("♻️ Resetando tarefas travadas...");
-
-  const { error } = await supabase.rpc("resetar_tarefas_travadas");
-
-  if (error) {
-    console.error("Erro ao resetar tarefas:", error.message);
-  }
+  await supabase.rpc("resetar_tarefas_travadas");
 }
 
-// 🔒 PEGAR TAREFA COM LOCK (CRÍTICO)
+// 🔒 LOCK
 async function pegarTarefa() {
-  const { data, error } = await supabase.rpc("pegar_tarefa");
-
-  if (error) {
-    console.error("Erro ao pegar tarefa:", error.message);
-    return null;
-  }
-
-  if (!data || data.length === 0) {
-    return null;
-  }
-
-  return data[0];
+  const { data } = await supabase.rpc("pegar_tarefa");
+  return data && data.length ? data[0] : null;
 }
 
-// ▶ EXECUTAR TAREFA
+// ▶ EXECUÇÃO
 async function executarTarefa(tarefa) {
-  console.log(`🚀 Executando tarefa ${tarefa.id}`);
+  const resultado = {
+    sucesso: true,
+    payload: tarefa.payload || null
+  };
 
-  try {
-    const resultado = {
-      sucesso: true,
-      mensagem: "Tarefa executada com sucesso",
-      payload: tarefa.payload || null
-    };
-
-    const { error } = await supabase
-      .from("tarefas")
-      .update({
-        status: "concluida",
-        resultado
-      })
-      .eq("id", tarefa.id);
-
-    if (error) {
-      console.error("Erro ao salvar resultado:", error.message);
-    }
-
-    console.log(`✅ Tarefa ${tarefa.id} concluída`);
-  } catch (err) {
-    console.error(`❌ Erro na tarefa ${tarefa.id}`, err.message);
-
-    await supabase
-      .from("tarefas")
-      .update({
-        status: "erro",
-        resultado: { erro: err.message }
-      })
-      .eq("id", tarefa.id);
-  }
+  await supabase
+    .from("tarefas")
+    .update({
+      status: "concluida",
+      resultado
+    })
+    .eq("id", tarefa.id);
 }
 
-// 🔁 ROTA PRINCIPAL
+// 🔁 RUN
 app.post("/run", async (req, res) => {
-  console.log("🔄 Iniciando execução");
+  res.json({ status: "processando" }); // responde IMEDIATO
 
   try {
     await resetarTarefasTravadas();
-
     const tarefa = await pegarTarefa();
 
-    if (!tarefa) {
-      console.log("📭 Sem tarefas");
-      return res.json({ message: "Sem tarefas" });
-    }
+    if (!tarefa) return;
 
     await executarTarefa(tarefa);
-
-    return res.json({
-      message: "Tarefa executada",
-      tarefa_id: tarefa.id
-    });
   } catch (err) {
-    console.error("Erro geral:", err.message);
-    return res.status(500).json({ error: err.message });
+    console.error("Erro:", err.message);
   }
 });
 
-// 🔗 ROTA COMPATÍVEL COM EDGE FUNCTION
+// 🔗 EXECUTAR
 app.post("/executar", async (req, res) => {
-  return app._router.handle(req, res);
+  return res.status(200).json({ ok: true });
 });
 
-// 🚀 START
+// START
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Runner rodando na porta ${PORT}`);
 });
