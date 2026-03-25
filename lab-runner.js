@@ -1,24 +1,21 @@
-import express from "express";
-import fetch from "node-fetch";
+const express = require("express");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3333;
 
-// 🔥 CONFIG (AJUSTADO COM SEU PROJECT)
 const SUPABASE_URL = "https://vshanjsktdngwlzcfdlc.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZzaGFuanNrdGRuZ3dsemNmZGxjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDE1NDE1OCwiZXhwIjoyMDg5NzMwMTU4fQ.nINfqUKx_7gK4_WFFCoEGQ4iz-Y3cLxrplpySh9nRPs";
 
-// Health check
 app.get("/", (req, res) => {
   res.json({ ok: true });
 });
 
-// 🔹 EXECUTOR PRINCIPAL
 app.post("/run", async (req, res) => {
   try {
-    // 1. Buscar tarefa pendente
+    console.log("RUN iniciado");
+
     const taskRes = await fetch(
       `${SUPABASE_URL}/rest/v1/tarefas?status=eq.pendente&limit=1`,
       {
@@ -37,15 +34,13 @@ app.post("/run", async (req, res) => {
 
     const tarefa = tarefas[0];
 
-    console.log("Executando tarefa:", tarefa.id);
+    console.log("Executando:", tarefa.id);
 
-    // 2. Simular execução (aqui entra IA depois)
     const resultado = {
       ok: true,
       executado_em: new Date().toISOString()
     };
 
-    // 3. Atualizar tarefa para concluída
     await fetch(
       `${SUPABASE_URL}/rest/v1/tarefas?id=eq.${tarefa.id}`,
       {
@@ -65,15 +60,11 @@ app.post("/run", async (req, res) => {
     res.json({ ok: true, tarefa: tarefa.id });
 
   } catch (err) {
-    console.error("Erro no runner:", err);
-
-    res.status(500).json({
-      ok: false,
-      erro: err.message
-    });
+    console.error("ERRO:", err);
+    res.status(500).json({ erro: err.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Runner rodando na porta ${PORT}`);
+  console.log("Rodando na porta", PORT);
 });
