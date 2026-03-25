@@ -1,17 +1,25 @@
-setInterval(async () => {
+// cron.js — dispara o runner manualmente ou via agendador externo
+// Uso: node cron.js
+// Ou configure no Railway como um Cron Job separado
+
+const RUNNER_URL = process.env.RUNNER_URL || "http://localhost:3333";
+
+async function executar() {
   try {
-    const res = await fetch("https://vshanjsktdngwlzcfdlc.supabase.co/functions/v1/processar-tarefa", {
+    const res = await fetch(`${RUNNER_URL}/run`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZzaGFuanNrdGRuZ3dsemNmZGxjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDE1NDE1OCwiZXhwIjoyMDg5NzMwMTU4fQ.nINfqUKx_7gK4_WFFCoEGQ4iz-Y3cLxrplpySh9nRPs"
-      },
-      body: "{}"
+      headers: { "Content-Type": "application/json" }
     });
 
-    const text = await res.text();
-    console.log("Cron:", text);
+    const data = await res.json();
+    console.log(`[${new Date().toISOString()}] Cron:`, data);
   } catch (err) {
-    console.error("Erro cron:", err);
+    console.error(`[${new Date().toISOString()}] Erro cron:`, err.message);
   }
-}, 15000);
+}
+
+// Executa a cada 15 segundos
+setInterval(executar, 15000);
+
+// Executa imediatamente na primeira vez
+executar();
