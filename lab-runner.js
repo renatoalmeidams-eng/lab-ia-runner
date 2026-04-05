@@ -403,23 +403,31 @@ async function executarCiclo() {
       }
     }
 
-    // 9. Aplicar arquivos via self-call /executar
+    // 9. Aplicar arquivos diretamente (sem self-call HTTP)
     const nomeProjeto = `lab-${tarefa.projeto_id}`;
-    const selfUrl     = `http://localhost:${PORT}`;
 
     console.log(`[orchestrator] Aplicando ${arquivos.length} arquivo(s) — projeto=${nomeProjeto}`);
 
     let resultadoRunner;
     try {
-      const runnerRes = await fetch(`${selfUrl}/executar`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nomeProjeto, arquivos, executarBuildFlag: true }),
-      });
-      resultadoRunner = await runnerRes.json();
-    } catch (errFetch) {
-      console.error(`[orchestrator] Erro no self-call /executar:`, errFetch.message);
-      resultadoRunner = { ok: false, aplicado: false, rodando: false, erro: errFetch.message };
+      const projetoPath               = criarProjeto(nomeProjeto);
+      const rodando                   = verificarProjeto(projetoPath);
+      const { aplicados, bloqueados } = aplicarArquivos(projetoPath, arquivos);
+      const buildResult               = aplicados.length > 0 ? executarBuild(projetoPath) : { ok: true, erro: null };
+
+      resultadoRunner = {
+        ok:                  aplicados.length > 0,
+        aplicado:            aplicados.length > 0,
+        rodando,
+        build:               buildResult.ok ? "ok" : "falhou",
+        build_erro:          buildResult.erro,
+        erro:                aplicados.length === 0 ? "nenhum arquivo aplicado" : null,
+        arquivos_escritos:   aplicados,
+        arquivos_bloqueados: bloqueados,
+      };
+    } catch (errExec) {
+      console.error(`[orchestrator] Erro ao aplicar arquivos:`, errExec.message);
+      resultadoRunner = { ok: false, aplicado: false, rodando: false, erro: errExec.message };
     }
 
     console.log(`[orchestrator] Runner resultado: ok=${resultadoRunner.ok} build=${resultadoRunner.build} aplicado=${resultadoRunner.aplicado}`);
