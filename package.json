@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "main": "lab-runner.js",
   "scripts": {
-    "start": "node lab-runner.js"
+    "start": "node start.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
