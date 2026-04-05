@@ -1,7 +1,7 @@
 require("dotenv").config();
-const express  = require("express");
-const fs       = require("fs");
-const path     = require("path");
+const express      = require("express");
+const fs           = require("fs");
+const path         = require("path");
 const { execSync } = require("child_process");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -36,6 +36,8 @@ function isProtected(caminho) {
   );
 }
 
+// ── ROTAS BÁSICAS ─────────────────────────────────────────────────────────────
+
 app.get("/", (req, res) => {
   res.status(200).json({ ok: true, status: "running", uptime: process.uptime() });
 });
@@ -50,6 +52,8 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ── HELPERS DO RUNNER ─────────────────────────────────────────────────────────
+
 function criarProjeto(nome) {
   const projetoPath = path.join(BASE_PATH, nome);
 
@@ -58,7 +62,7 @@ function criarProjeto(nome) {
   }
 
   if (!fs.existsSync(projetoPath)) {
-    console.log(`[runner] Criando projeto React: ${nome}`);
+    console.log(`[runner] Criando projeto: ${nome}`);
 
     fs.mkdirSync(projetoPath, { recursive: true });
     fs.mkdirSync(path.join(projetoPath, "src"), { recursive: true });
@@ -115,6 +119,7 @@ function aplicarArquivos(projetoPath, arquivos) {
     const conteudo = arquivo.codigo  || arquivo.content || "";
 
     if (!caminho) { console.warn("[runner] Arquivo sem caminho — ignorado"); continue; }
+
     if (isProtected(caminho)) {
       console.warn(`[runner] 🔒 Bloqueado: ${caminho}`);
       bloqueados.push(caminho);
@@ -139,17 +144,17 @@ function verificarProjeto(projetoPath) {
 }
 
 function executarBuild(projetoPath) {
-  console.log(`[runner] Instalando dependências antes do build...`);
+  console.log(`[runner] npm install...`);
   try {
     execSync("npm install", { cwd: projetoPath, stdio: "pipe", timeout: 120000 });
   } catch (e) {
-    console.warn("[runner] npm install com avisos:", e.message?.slice(0, 200));
+    console.warn("[runner] npm install avisos:", e.message?.slice(0, 200));
   }
 
-  console.log(`[runner] Executando build em: ${projetoPath}`);
+  console.log(`[runner] npm run build...`);
   try {
     execSync("npm run build", { cwd: projetoPath, stdio: "pipe", timeout: 60000 });
-    console.log("[runner] ✅ Build concluído com sucesso");
+    console.log("[runner] ✅ Build ok");
     return { ok: true, erro: null };
   } catch (err) {
     const mensagem = err.stderr?.toString() || err.stdout?.toString() || err.message;
@@ -158,12 +163,17 @@ function executarBuild(projetoPath) {
   }
 }
 
+// ── HELPERS DO ORCHESTRATOR ───────────────────────────────────────────────────
+
 async function notificarChatConclusao(projeto_id, tarefa, resumo) {
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/chat-projeto`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${SUPABASE_KEY}` },
-      body: JSON.stringify({ projeto_id, mensagem: `[Sistema] ${resumo} O que devo implementar agora?` }),
+      body: JSON.stringify({
+        projeto_id,
+        mensagem: `[Sistema] ${resumo} O que devo implementar agora?`,
+      }),
     });
     const data = await res.json();
     if (data.ok) console.log(`[orchestrator] 💬 Chat notificado: ${data.resposta?.substring(0, 80)}...`);
@@ -173,9 +183,14 @@ async function notificarChatConclusao(projeto_id, tarefa, resumo) {
   }
 }
 
-async function inserirLog(tarefa_id, status, erro, tentativas) {
+async function inserirLog(tarefa_id, status, resultado, tentativas) {
   try {
-    await supabase.from("logs_execucao").insert({ tarefa_id, status, erro: erro || null, tentativas: tentativas || 0 });
+    await supabase.from("logs_execucao").insert({
+      tarefa_id,
+      status,
+      resultado: resultado || null,
+      tentativas: tentativas || 0,
+    });
   } catch (e) {
     console.error("[runner] Falha ao inserir log:", e.message);
   }
@@ -183,7 +198,13 @@ async function inserirLog(tarefa_id, status, erro, tentativas) {
 
 async function inserirEvento(projeto_id, tarefa_id, tipo, payload) {
   try {
-    await supabase.from("eventos").insert({ projeto_id, tarefa_id, tipo, payload: payload || {}, processado: false });
+    await supabase.from("eventos").insert({
+      projeto_id,
+      tarefa_id,
+      tipo,
+      payload:    payload || {},
+      processado: false,
+    });
   } catch (e) {
     console.error("[runner] Falha ao inserir evento:", e.message);
   }
@@ -191,7 +212,8 @@ async function inserirEvento(projeto_id, tarefa_id, tipo, payload) {
 
 async function gerarCodigoComIA(tarefa, projeto) {
   try {
-    console.log(`[orchestrator] Chamando executor — tarefa=${tarefa.id}`);
+    console.log(`[orchestrator] Chamando executor IA — tarefa=${tarefa.id}`);
+
     const res = await fetch(`${SUPABASE_URL}/functions/v1/executar-agente`, {
       method:  "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${SUPABASE_KEY}` },
@@ -214,16 +236,17 @@ async function gerarCodigoComIA(tarefa, projeto) {
     const data = await res.json();
 
     if (!res.ok || !data.ok) {
-      console.error(`[orchestrator] Executor falhou:`, JSON.stringify(data).slice(0, 200));
+      console.error(`[orchestrator] Executor falhou HTTP ${res.status}:`, JSON.stringify(data).slice(0, 300));
       return [];
     }
 
     const output   = data.output || {};
     const arquivos = Array.isArray(output.arquivos) ? output.arquivos : [];
 
+    console.log(`[orchestrator] Executor retornou ${arquivos.length} arquivo(s). Keys: ${Object.keys(output).join(", ")}`);
+
     if (!arquivos.length) {
-      console.warn(`[orchestrator] Executor não retornou arquivos válidos`);
-      console.warn(`[orchestrator] Output keys:`, Object.keys(output).join(", "));
+      console.warn(`[orchestrator] Executor não retornou arquivos. Output completo:`, JSON.stringify(output).slice(0, 500));
     }
 
     return arquivos;
@@ -232,6 +255,8 @@ async function gerarCodigoComIA(tarefa, projeto) {
     return [];
   }
 }
+
+// ── ROTA /executar ────────────────────────────────────────────────────────────
 
 app.post("/executar", async (req, res) => {
   const { nomeProjeto, arquivos = [], executarBuildFlag = false } = req.body;
@@ -251,36 +276,53 @@ app.post("/executar", async (req, res) => {
     console.log(`[runner] /executar — aplicado=${aplicados.length} bloqueados=${bloqueados.length} build=${buildResult.ok}`);
 
     return res.status(200).json({
-      ok:                  buildResult.ok,
+      ok:                  aplicados.length > 0, // ← CORRIGIDO: sucesso = arquivos aplicados, não build
       aplicado:            aplicados.length > 0,
       rodando,
       build:               buildResult.ok ? "ok" : "falhou",
       build_erro:          buildResult.erro,
-      erro:                buildResult.ok ? null : buildResult.erro,
+      erro:                aplicados.length === 0 ? "nenhum arquivo aplicado" : null,
       arquivos_escritos:   aplicados,
       arquivos_bloqueados: bloqueados,
     });
+
   } catch (err) {
     console.error("[runner] /executar ERRO:", err.message);
     return res.status(500).json({ ok: false, aplicado: false, rodando: false, erro: err.message });
   }
 });
 
-// ── ORCHESTRATOR LOOP (interno — substitui cron.js externo) ──────────────────
+// ── CICLO DO ORCHESTRATOR ─────────────────────────────────────────────────────
+
 async function executarCiclo() {
   global.lastCronRun = new Date().toISOString();
   try {
+    // 1. Liberar tarefas travadas há mais de 10 minutos
     const { error: errReset } = await supabase.rpc("resetar_tarefas_travadas");
     if (errReset) console.error("[orchestrator] Falha ao resetar travadas:", errReset.message);
 
+    // 2. Pegar próxima tarefa (lock atômico — tentativas já incrementadas pelo banco)
     const { data: tarefas, error: errPegar } = await supabase.rpc("pegar_tarefa");
     if (errPegar) { console.error("[orchestrator] Falha ao pegar tarefa:", errPegar.message); return; }
-
     if (!tarefas || tarefas.length === 0) { console.log("[orchestrator] Nenhuma tarefa pendente"); return; }
 
     const tarefa = tarefas[0];
-    console.log(`[orchestrator] Tarefa: ${tarefa.id} | tipo=${tarefa.tipo_tarefa} | tentativas=${tarefa.tentativas || 0}`);
+    // tentativas já vem incrementado do banco (pegar_tarefa faz o UPDATE atômico)
+    const tentativas = tarefa.tentativas || 1;
 
+    console.log(`[orchestrator] Tarefa: ${tarefa.id} | tipo=${tarefa.tipo_tarefa} | tentativa=${tentativas}/${MAX_RETRY}`);
+
+    // 3. Verificar MAX_RETRY — bloquear imediatamente se excedeu
+    if (tentativas > MAX_RETRY) {
+      console.error(`[orchestrator] ❌ Tarefa ${tarefa.id} excedeu MAX_RETRY=${MAX_RETRY} — bloqueando`);
+      await supabase.from("tarefas")
+        .update({ status: "bloqueado", resultado: { erro: "max_retry_atingido", tentativas } })
+        .eq("id", tarefa.id);
+      await inserirEvento(tarefa.projeto_id, tarefa.id, "tarefa_bloqueada", { erro: "max_retry_atingido", tentativas });
+      return;
+    }
+
+    // 4. Buscar projeto
     const { data: projeto } = await supabase
       .from("projetos")
       .select("id, origem, status_etapa, stack_detectada, dependencias_externas, banco_externo")
@@ -288,70 +330,101 @@ async function executarCiclo() {
       .single();
 
     if (!projeto) {
-      await supabase.from("tarefas").update({ status: "erro", resultado: { erro: "projeto_nao_encontrado" } }).eq("id", tarefa.id);
+      console.error("[orchestrator] Projeto não encontrado:", tarefa.projeto_id);
+      await supabase.from("tarefas")
+        .update({ status: "erro", resultado: { erro: "projeto_nao_encontrado" } })
+        .eq("id", tarefa.id);
       return;
     }
 
+    // 5. Verificar dependências
     if (tarefa.dependencias && tarefa.dependencias.length > 0) {
-      const { data: deps } = await supabase.from("tarefas").select("id, status").in("id", tarefa.dependencias);
+      const { data: deps } = await supabase
+        .from("tarefas").select("id, status").in("id", tarefa.dependencias);
       const pendentes = (deps || []).filter((d) => d.status !== "concluida");
       if (pendentes.length > 0) {
-        await supabase.from("tarefas").update({ status: "pendente", em_execucao_por: null, iniciado_em: null }).eq("id", tarefa.id);
+        console.log(`[orchestrator] Tarefa ${tarefa.id} aguardando dependências`);
+        await supabase.from("tarefas")
+          .update({ status: "pendente", em_execucao_por: null, iniciado_em: null })
+          .eq("id", tarefa.id);
         return;
       }
     }
 
+    // 6. Bloquear alterações de banco em projetos importados
     const TIPOS_BANCO = ["alterar_banco", "dropar_banco", "migrar_banco"];
     if (projeto.origem === "importado" && TIPOS_BANCO.includes(tarefa.tipo_tarefa)) {
-      await supabase.from("tarefas").update({ status: "pendente", requer_aprovacao: true, em_execucao_por: null, iniciado_em: null }).eq("id", tarefa.id);
-      await inserirEvento(projeto.id, tarefa.id, "aprovacao_necessaria", { motivo: "alteracao_banco_projeto_importado" });
+      console.log(`[orchestrator] Bloqueando alteração de banco em projeto importado`);
+      await supabase.from("tarefas")
+        .update({ status: "pendente", requer_aprovacao: true, em_execucao_por: null, iniciado_em: null })
+        .eq("id", tarefa.id);
+      await inserirEvento(projeto.id, tarefa.id, "aprovacao_necessaria", {
+        motivo: "alteracao_banco_projeto_importado", tipo_tarefa: tarefa.tipo_tarefa,
+      });
       return;
     }
 
-    let arquivos = tarefa.payload?.arquivos || tarefa.resultado?.arquivos || [];
-
-    if (!arquivos.length && tarefa.tipo_tarefa === "planejamento") {
-      await supabase.from("tarefas").update({ status: "concluida", resultado: { aviso: "planejamento_concluido" } }).eq("id", tarefa.id);
-      await inserirLog(tarefa.id, "sucesso", null, tarefa.tentativas || 0);
+    // 7. Tarefas de planejamento não geram arquivos — concluir direto
+    if (tarefa.tipo_tarefa === "planejamento") {
+      console.log(`[orchestrator] Planejamento concluído — sem arquivos`);
+      await supabase.from("tarefas")
+        .update({ status: "concluida", resultado: { aviso: "planejamento_concluido" } })
+        .eq("id", tarefa.id);
+      await inserirLog(tarefa.id, "sucesso", null, tentativas);
       await inserirEvento(projeto.id, tarefa.id, "execucao_sucesso", { tipo: "planejamento" });
       await notificarChatConclusao(projeto.id, tarefa, "Planejamento concluído.");
       return;
     }
 
+    // 8. Verificar se já há arquivos no payload, ou chamar executor IA
+    let arquivos = tarefa.payload?.arquivos || tarefa.resultado?.arquivos || [];
+
     if (!arquivos.length) {
+      console.log(`[orchestrator] Sem arquivos no payload — chamando executor IA`);
       arquivos = await gerarCodigoComIA(tarefa, projeto);
+
       if (!arquivos || !arquivos.length) {
-        const tentativas = (tarefa.tentativas || 0) + 1;
         const erro = "Executor não gerou arquivos válidos";
+        console.error(`[orchestrator] ❌ ${erro} — tentativa ${tentativas}/${MAX_RETRY}`);
         await inserirLog(tarefa.id, "erro", erro, tentativas);
+
         if (tentativas >= MAX_RETRY) {
-          await supabase.from("tarefas").update({ status: "bloqueado", resultado: { erro } }).eq("id", tarefa.id);
-          await inserirEvento(projeto.id, tarefa.id, "tarefa_bloqueada", { erro });
+          await supabase.from("tarefas")
+            .update({ status: "bloqueado", resultado: { erro, tentativas } })
+            .eq("id", tarefa.id);
+          await inserirEvento(projeto.id, tarefa.id, "tarefa_bloqueada", { erro, motivo: "executor_falhou" });
         } else {
-          await supabase.from("tarefas").update({ status: "pendente", em_execucao_por: null, iniciado_em: null }).eq("id", tarefa.id);
+          await supabase.from("tarefas")
+            .update({ status: "pendente", em_execucao_por: null, iniciado_em: null })
+            .eq("id", tarefa.id);
+          await inserirEvento(projeto.id, tarefa.id, "execucao_erro", { erro, proximo: "retry", tentativa: tentativas });
         }
         return;
       }
     }
 
+    // 9. Aplicar arquivos via self-call /executar
     const nomeProjeto = `lab-${tarefa.projeto_id}`;
-    console.log(`[orchestrator] Aplicando ${arquivos.length} arquivos — projeto=${nomeProjeto}`);
+    const selfUrl     = `http://localhost:${PORT}`;
+
+    console.log(`[orchestrator] Aplicando ${arquivos.length} arquivo(s) — projeto=${nomeProjeto}`);
 
     let resultadoRunner;
     try {
-      const selfUrl = `http://localhost:${PORT}`;
       const runnerRes = await fetch(`${selfUrl}/executar`, {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ nomeProjeto, arquivos, executarBuildFlag: true }),
       });
       resultadoRunner = await runnerRes.json();
     } catch (errFetch) {
+      console.error(`[orchestrator] Erro no self-call /executar:`, errFetch.message);
       resultadoRunner = { ok: false, aplicado: false, rodando: false, erro: errFetch.message };
     }
 
-    console.log(`[orchestrator] Runner: ok=${resultadoRunner.ok} build=${resultadoRunner.build}`);
+    console.log(`[orchestrator] Runner resultado: ok=${resultadoRunner.ok} build=${resultadoRunner.build} aplicado=${resultadoRunner.aplicado}`);
 
+    // 10. Processar resultado
     if (resultadoRunner.ok && resultadoRunner.aplicado) {
       await supabase.from("tarefas").update({
         status: "concluida",
@@ -364,7 +437,8 @@ async function executarCiclo() {
         },
       }).eq("id", tarefa.id);
 
-      await inserirLog(tarefa.id, "sucesso", null, tarefa.tentativas || 0);
+      await inserirLog(tarefa.id, "sucesso", null, tentativas);
+
       await inserirEvento(projeto.id, tarefa.id, "codigo_aplicado", {
         arquivos_escritos: resultadoRunner.arquivos_escritos || [],
         nomeProjeto,
@@ -372,41 +446,60 @@ async function executarCiclo() {
 
       if (resultadoRunner.build === "ok") {
         await inserirEvento(projeto.id, tarefa.id, "execucao_sucesso", { nomeProjeto, build: "ok" });
-        await notificarChatConclusao(projeto.id, tarefa, `Tarefa concluída: ${tarefa.payload?.titulo || tarefa.tipo_tarefa}. Build ok.`);
-      }
-      if (resultadoRunner.build === "falhou") {
-        await inserirEvento(projeto.id, tarefa.id, "build_falhou", { nomeProjeto, erro: resultadoRunner.build_erro });
+        await notificarChatConclusao(
+          projeto.id, tarefa,
+          `Tarefa concluída: ${tarefa.payload?.titulo || tarefa.tipo_tarefa}. Build ok. Arquivos: ${(resultadoRunner.arquivos_escritos || []).join(", ")}.`
+        );
+      } else if (resultadoRunner.build === "falhou") {
+        // Build falhou mas arquivos foram aplicados — tarefa concluída mesmo assim
+        await inserirEvento(projeto.id, tarefa.id, "build_falhou", {
+          nomeProjeto, erro: resultadoRunner.build_erro,
+        });
+        await notificarChatConclusao(
+          projeto.id, tarefa,
+          `Tarefa concluída: ${tarefa.payload?.titulo || tarefa.tipo_tarefa}. Arquivos aplicados mas build falhou. Erro: ${resultadoRunner.build_erro?.substring(0, 200)}.`
+        );
       }
 
       console.log(`[orchestrator] ✅ Tarefa ${tarefa.id} concluída — build=${resultadoRunner.build}`);
 
     } else {
-      const tentativas = (tarefa.tentativas || 0) + 1;
-      const erro       = resultadoRunner.erro || "Erro desconhecido no runner";
+      // Runner falhou — retry ou bloquear
+      const erro = resultadoRunner.erro || "Erro desconhecido no runner";
+      console.error(`[orchestrator] ❌ Runner falhou: ${erro} — tentativa ${tentativas}/${MAX_RETRY}`);
+
       await inserirLog(tarefa.id, "erro", erro, tentativas);
+
       if (tentativas >= MAX_RETRY) {
-        await supabase.from("tarefas").update({ status: "bloqueado", resultado: { erro } }).eq("id", tarefa.id);
-        await inserirEvento(projeto.id, tarefa.id, "tarefa_bloqueada", { erro });
+        console.error(`[orchestrator] ❌ Bloqueada após ${tentativas} tentativas: ${tarefa.id}`);
+        await supabase.from("tarefas")
+          .update({ status: "bloqueado", resultado: { erro, tentativas } })
+          .eq("id", tarefa.id);
+        await inserirEvento(projeto.id, tarefa.id, "tarefa_bloqueada", { erro, motivo: "max_retry_atingido" });
       } else {
-        await supabase.from("tarefas").update({ status: "pendente", em_execucao_por: null, iniciado_em: null }).eq("id", tarefa.id);
+        console.warn(`[orchestrator] ⚠️ Retry ${tentativas}/${MAX_RETRY}: ${tarefa.id}`);
+        await supabase.from("tarefas")
+          .update({ status: "pendente", em_execucao_por: null, iniciado_em: null })
+          .eq("id", tarefa.id);
+        await inserirEvento(projeto.id, tarefa.id, "execucao_erro", { erro, proximo: "retry", tentativa: tentativas });
       }
     }
 
   } catch (err) {
-    console.error("[orchestrator] ERRO INESPERADO:", err.message);
+    console.error("[orchestrator] ERRO INESPERADO:", err.message, err.stack?.slice(0, 500));
   }
 }
 
-// ── START SERVER ─────────────────────────────────────────────────────────────
+// ── START SERVER + CRON INTERNO ───────────────────────────────────────────────
+
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Lab Runner rodando na porta ${PORT}`);
   console.log(`📦 Projetos em: ${BASE_PATH}`);
   console.log(`⏱️  Cron interno iniciando em 5s — intervalo: ${CRON_MS}ms`);
 
-  // Inicia o loop interno após 5s (aguarda o servidor estar pronto)
   setTimeout(() => {
     console.log("[cron] ✅ Loop interno iniciado");
-    executarCiclo(); // primeiro ciclo imediato
+    executarCiclo();
     setInterval(executarCiclo, CRON_MS);
   }, 5000);
 });
