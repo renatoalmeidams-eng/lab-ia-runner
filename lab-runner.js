@@ -165,6 +165,189 @@ function executarBuild(projetoPath) {
 
 // ── HELPERS DO ORCHESTRATOR ───────────────────────────────────────────────────
 
+async function processarResultadoAuditoria(projeto, tarefa, resultadoRunner) {
+  try {
+    // Chamar executor para gerar o relatório de auditoria via IA
+    console.log(`[orchestrator] 🔍 Executando auditoria IA — tarefa=${tarefa.id}`);
+
+    const tarefasIds = tarefa.payload?.tarefas_auditadas || [];
+    const { data: tarefasAuditadas } = await supabase
+      .from('tarefas')
+      .select('id, tipo_tarefa, payload, resultado')
+      .in('id', tarefasIds.length > 0 ? tarefasIds : ['00000000-0000-0000-0000-000000000000']);
+
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/executar-agente`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      body: JSON.stringify({
+        agente: 'auditor',
+        projeto_id: projeto.id,
+        tarefa_id: tarefa.id,
+        input: {
+          tarefas: (tarefasAuditadas || []).map(t => ({
+            id: t.id,
+            tipo: t.tipo_tarefa,
+            titulo: t.payload?.titulo,
+            arquivos: t.resultado?.arquivos_escritos || [],
+          })),
+          stack: projeto.stack_detectada || 'React, Node.js',
+          banco: projeto.banco_externo || null,
+        },
+      }),
+    });
+
+    const data = await res.json();
+    const output = data.output || {};
+    const riscos = output.riscos || [];
+
+    // Marcar tarefa de auditoria como concluída
+    await supabase.from('tarefas').update({
+      status: 'concluida',
+      resultado: { riscos, resumo: output.resumo_auditoria || 'Auditoria concluída' },
+    }).eq('id', tarefa.id);
+
+    await inserirLog(tarefa.id, 'sucesso', null, tarefa.tentativas || 1);
+
+    // Verificar se há riscos críticos (score >= 6 ou bloqueia_execucao)
+    const riscosCriticos = riscos.filter(r => r.bloqueia_execucao || r.score >= 6);
+    const riscosAltos = riscos.filter(r => r.classificacao === 'alto' || r.impacto === 'alto');
+
+    if (riscosCriticos.length > 0 || riscosAltos.length > 0) {
+      // Criar tarefas de correção automaticamente
+      console.log(`[orchestrator] ⚠️ ${riscosCriticos.length} riscos críticos — criando tarefas de correção`);
+
+      for (const risco of [...riscosCriticos, ...riscosAltos.filter(r => !riscosCriticos.includes(r))]) {
+        if (!risco.mitigacao) continue;
+        await supabase.from('tarefas').insert({
+          projeto_id: projeto.id,
+          plano_id: tarefa.plano_id,
+          tipo_tarefa: 'correcao_bug',
+          status: 'pendente',
+          prioridade: risco.mitigacao.prioridade_num || 2,
+          requer_aprovacao: false,
+          ordem_execucao: 998,
+          payload: {
+            titulo: risco.mitigacao.titulo || 'Correção de risco',
+            descricao: risco.mitigacao.descricao,
+            risco_original: risco.descricao,
+          },
+        });
+      }
+
+      // Voltar para execução
+      await supabase.rpc('transicionar_etapa', {
+        p_projeto_id: projeto.id,
+        p_etapa_para: 'execucao',
+        p_origem: 'auditoria_automatica',
+      });
+
+      await inserirEvento(projeto.id, tarefa.id, 'aprovacao_necessaria', {
+        tipo: 'correcoes_geradas',
+        total_riscos: riscosCriticos.length,
+        resumo: output.resumo_auditoria,
+      });
+
+      await notificarChatConclusao(projeto.id, tarefa,
+        `Auditoria concluída. ${riscosCriticos.length} riscos críticos encontrados. Tarefas de correção criadas automaticamente.`);
+
+    } else {
+      // Sem riscos críticos — transicionar para revisão
+      console.log(`[orchestrator] ✅ Auditoria ok — transitando para revisão`);
+
+      await supabase.rpc('transicionar_etapa', {
+        p_projeto_id: projeto.id,
+        p_etapa_para: 'revisao',
+        p_origem: 'auditoria_automatica',
+      });
+
+      await inserirEvento(projeto.id, tarefa.id, 'execucao_sucesso', {
+        tipo: 'auditoria_aprovada',
+        resumo: output.resumo_auditoria,
+        total_riscos: riscos.length,
+      });
+
+      await notificarChatConclusao(projeto.id, tarefa,
+        `Auditoria concluída sem riscos críticos. O sistema está pronto para revisão. ${output.resumo_auditoria || ''}`);
+    }
+
+  } catch (err) {
+    console.error('[orchestrator] Erro ao processar auditoria:', err.message);
+    await supabase.from('tarefas')
+      .update({ status: 'pendente', tentativas: (tarefa.tentativas || 0) })
+      .eq('id', tarefa.id);
+  }
+}
+
+
+  if (!plano_id) return;
+  try {
+    // Verificar se todas as tarefas do plano foram concluídas
+    const { data: tarefas } = await supabase
+      .from('tarefas')
+      .select('id, status')
+      .eq('plano_id', plano_id)
+      .neq('resultado->>aviso', 'duplicata');
+
+    if (!tarefas || tarefas.length === 0) return;
+
+    const pendentes = tarefas.filter(t => !['concluida', 'bloqueado'].includes(t.status));
+    if (pendentes.length > 0) return; // ainda tem tarefas rodando
+
+    const concluidas = tarefas.filter(t => t.status === 'concluida');
+    if (concluidas.length === 0) return;
+
+    console.log(`[orchestrator] ✅ Plano ${plano_id} concluído — disparando auditoria automática`);
+
+    // Verificar se já existe tarefa de auditoria para esse plano
+    const { data: auditoriaExistente } = await supabase
+      .from('tarefas')
+      .select('id')
+      .eq('projeto_id', projeto_id)
+      .eq('tipo_tarefa', 'auditoria')
+      .eq('plano_id', plano_id)
+      .limit(1);
+
+    if (auditoriaExistente && auditoriaExistente.length > 0) {
+      console.log(`[orchestrator] Auditoria já existe para plano ${plano_id} — ignorando`);
+      return;
+    }
+
+    // Transicionar para auditoria
+    await supabase.rpc('transicionar_etapa', {
+      p_projeto_id: projeto_id,
+      p_etapa_para: 'auditoria',
+      p_origem: 'orchestrator',
+    });
+
+    // Criar tarefa de auditoria automática
+    const { data: novaTarefa } = await supabase.from('tarefas').insert({
+      projeto_id,
+      plano_id,
+      tipo_tarefa: 'auditoria',
+      status: 'pendente',
+      prioridade: 5,
+      requer_aprovacao: false,
+      ordem_execucao: 999,
+      payload: {
+        titulo: 'Auditoria Automática do Plano',
+        descricao: 'Auditar todas as tarefas concluídas do plano e identificar riscos ou bugs',
+        tarefas_auditadas: concluidas.map(t => t.id),
+      },
+    }).select('id').single();
+
+    if (novaTarefa) {
+      await inserirEvento(projeto_id, novaTarefa.id, 'aprovacao_necessaria', {
+        tipo: 'auditoria_iniciada',
+        plano_id,
+        tarefas_concluidas: concluidas.length,
+      });
+      console.log(`[orchestrator] 🔍 Tarefa de auditoria criada: ${novaTarefa.id}`);
+    }
+  } catch (err) {
+    console.error('[orchestrator] Erro ao verificar plano concluído:', err.message);
+  }
+}
+
 async function notificarChatConclusao(projeto_id, tarefa, resumo) {
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/chat-projeto`, {
@@ -403,7 +586,10 @@ async function executarCiclo() {
       }
     }
 
-    // 9. Aplicar arquivos diretamente (sem self-call HTTP)
+    if (tarefa.tipo_tarefa === 'auditoria') {
+      await processarResultadoAuditoria(projeto, tarefa, resultadoRunner);
+      return;
+    }
     const nomeProjeto = `lab-${tarefa.projeto_id}`;
 
     console.log(`[orchestrator] Aplicando ${arquivos.length} arquivo(s) — projeto=${nomeProjeto}`);
@@ -470,6 +656,9 @@ async function executarCiclo() {
       }
 
       console.log(`[orchestrator] ✅ Tarefa ${tarefa.id} concluída — build=${resultadoRunner.build}`);
+
+      // Verificar se todo o plano foi concluído e disparar auditoria automática
+      await verificarPlanoConcluidoEAuditar(projeto.id, tarefa.plano_id);
 
     } else {
       // Runner falhou — retry ou bloquear
