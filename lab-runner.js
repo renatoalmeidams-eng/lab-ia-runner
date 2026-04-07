@@ -52,6 +52,23 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ── ROTA PREVIEW ──────────────────────────────────────────────────────────────
+
+app.use("/preview/:projeto_id", (req, res, next) => {
+  const distPath = path.join(BASE_PATH, `lab-${req.params.projeto_id}`, "dist");
+  if (!fs.existsSync(distPath)) {
+    return res.status(404).json({
+      ok: false,
+      erro: "Preview não disponível — build não encontrado para este projeto.",
+    });
+  }
+  // Serve index.html para qualquer rota (SPA fallback)
+  req.url = req.url === "/" || req.url === "" ? "/index.html" : req.url;
+  express.static(distPath)(req, res, () => {
+    res.sendFile(path.join(distPath, "index.html"));
+  });
+});
+
 // ── HELPERS DO RUNNER ─────────────────────────────────────────────────────────
 
 function criarProjeto(nome) {
@@ -168,10 +185,7 @@ function executarBuild(projetoPath) {
 async function inserirLog(tarefa_id, status, resultado, tentativas) {
   try {
     await supabase.from("logs_execucao").insert({
-      tarefa_id,
-      status,
-      resultado: resultado || null,
-      tentativas: tentativas || 0,
+      tarefa_id, status, resultado: resultado || null, tentativas: tentativas || 0,
     });
   } catch (e) {
     console.error("[runner] Falha ao inserir log:", e.message);
@@ -181,33 +195,36 @@ async function inserirLog(tarefa_id, status, resultado, tentativas) {
 async function inserirEvento(projeto_id, tarefa_id, tipo, payload) {
   try {
     await supabase.from("eventos").insert({
-      projeto_id,
-      tarefa_id,
-      tipo,
-      payload:    payload || {},
-      processado: false,
+      projeto_id, tarefa_id, tipo, payload: payload || {}, processado: false,
     });
   } catch (e) {
     console.error("[runner] Falha ao inserir evento:", e.message);
   }
 }
 
-async function notificarChatConclusao(projeto_id, tarefa, resumo) {
+async function notificarChat(projeto_id, mensagem) {
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/chat-projeto`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${SUPABASE_KEY}` },
-      body: JSON.stringify({
-        projeto_id,
-        mensagem: `[Sistema] ${resumo} O que devo implementar agora?`,
-      }),
+      body: JSON.stringify({ projeto_id, mensagem }),
     });
     const data = await res.json();
-    if (data.ok) console.log(`[orchestrator] 💬 Chat notificado: ${data.resposta?.substring(0, 80)}...`);
-    else console.warn(`[orchestrator] Chat notificação falhou:`, data.erro);
+    if (!data.ok) console.warn(`[orchestrator] Chat notificação falhou:`, data.erro);
   } catch (err) {
     console.warn(`[orchestrator] Erro ao notificar chat:`, err.message);
   }
+}
+
+async function notificarChatInicio(projeto_id, tarefa) {
+  const titulo = tarefa.payload?.titulo || tarefa.tipo_tarefa;
+  await notificarChat(projeto_id,
+    `[Sistema] Iniciando tarefa: ${titulo} (tipo: ${tarefa.tipo_tarefa}).`
+  );
+}
+
+async function notificarChatConclusao(projeto_id, tarefa, resumo) {
+  await notificarChat(projeto_id, `[Sistema] ${resumo}`);
 }
 
 async function gerarCodigoComIA(tarefa, projeto) {
@@ -224,7 +241,7 @@ async function gerarCodigoComIA(tarefa, projeto) {
         input: {
           titulo:             tarefa.payload?.titulo      || tarefa.tipo_tarefa,
           descricao:          tarefa.payload?.descricao   || "",
-          stack:              tarefa.payload?.stack       || projeto?.stack_detectada || "React, Node.js",
+          stack:              tarefa.payload?.stack       || projeto?.stack_detectada || "React + Vite (frontend)",
           dependencias:       tarefa.payload?.dependencias || [],
           banco:              projeto?.banco_externo      || null,
           arquivos_esperados: tarefa.payload?.arquivos_esperados || [],
@@ -243,10 +260,9 @@ async function gerarCodigoComIA(tarefa, projeto) {
     const output   = data.output || {};
     const arquivos = Array.isArray(output.arquivos) ? output.arquivos : [];
 
-    console.log(`[orchestrator] Executor retornou ${arquivos.length} arquivo(s). Keys: ${Object.keys(output).join(", ")}`);
-
+    console.log(`[orchestrator] Executor retornou ${arquivos.length} arquivo(s)`);
     if (!arquivos.length) {
-      console.warn(`[orchestrator] Executor não retornou arquivos. Output completo:`, JSON.stringify(output).slice(0, 500));
+      console.warn(`[orchestrator] Output completo:`, JSON.stringify(output).slice(0, 500));
     }
 
     return arquivos;
@@ -280,7 +296,7 @@ async function processarResultadoAuditoria(projeto, tarefa) {
             titulo: t.payload?.titulo,
             arquivos: t.resultado?.arquivos_escritos || [],
           })),
-          stack: projeto.stack_detectada || 'React, Node.js',
+          stack: projeto.stack_detectada || 'React + Vite (frontend)',
           banco: projeto.banco_externo || null,
         },
       }),
@@ -307,17 +323,17 @@ async function processarResultadoAuditoria(projeto, tarefa) {
       for (const risco of todosGraves) {
         if (!risco.mitigacao) continue;
         await supabase.from('tarefas').insert({
-          projeto_id:      projeto.id,
-          plano_id:        tarefa.plano_id,
-          tipo_tarefa:     'correcao_bug',
-          status:          'pendente',
-          prioridade:      risco.mitigacao.prioridade_num || 2,
+          projeto_id:       projeto.id,
+          plano_id:         tarefa.plano_id,
+          tipo_tarefa:      'correcao_bug',
+          status:           'pendente',
+          prioridade:       risco.mitigacao.prioridade_num || 2,
           requer_aprovacao: false,
-          ordem_execucao:  998,
+          ordem_execucao:   998,
           payload: {
-            titulo:          risco.mitigacao.titulo || 'Correção de risco',
-            descricao:       risco.mitigacao.descricao,
-            risco_original:  risco.descricao,
+            titulo:         risco.mitigacao.titulo || 'Correção de risco',
+            descricao:      risco.mitigacao.descricao,
+            risco_original: risco.descricao,
           },
         });
       }
@@ -335,7 +351,8 @@ async function processarResultadoAuditoria(projeto, tarefa) {
       });
 
       await notificarChatConclusao(projeto.id, tarefa,
-        `Auditoria concluída. ${riscosCriticos.length} riscos críticos encontrados. Tarefas de correção criadas automaticamente.`);
+        `${riscosCriticos.length} riscos críticos encontrados. Tarefas de correção criadas automaticamente.`
+      );
 
     } else {
       console.log(`[orchestrator] ✅ Auditoria ok — transitando para revisão`);
@@ -353,12 +370,12 @@ async function processarResultadoAuditoria(projeto, tarefa) {
       });
 
       await notificarChatConclusao(projeto.id, tarefa,
-        `Auditoria concluída sem riscos críticos. O sistema está pronto para revisão. ${output.resumo_auditoria || ''}`);
+        `Auditoria concluída sem riscos críticos. ${output.resumo_auditoria || ''}`
+      );
     }
 
   } catch (err) {
     console.error('[orchestrator] Erro ao processar auditoria:', err.message);
-    // Devolver para pendente para retry
     await supabase.from('tarefas')
       .update({ status: 'pendente', em_execucao_por: null, iniciado_em: null })
       .eq('id', tarefa.id);
@@ -406,14 +423,14 @@ async function verificarPlanoConcluidoEAuditar(projeto_id, plano_id) {
     const { data: novaTarefa } = await supabase.from('tarefas').insert({
       projeto_id,
       plano_id,
-      tipo_tarefa:     'auditoria',
-      status:          'pendente',
-      prioridade:      5,
+      tipo_tarefa:      'auditoria',
+      status:           'pendente',
+      prioridade:       5,
       requer_aprovacao: false,
-      ordem_execucao:  999,
+      ordem_execucao:   999,
       payload: {
-        titulo:           'Auditoria Automática do Plano',
-        descricao:        'Auditar todas as tarefas concluídas do plano e identificar riscos ou bugs',
+        titulo:            'Auditoria Automática do Plano',
+        descricao:         'Auditar todas as tarefas concluídas do plano e identificar riscos ou bugs',
         tarefas_auditadas: concluidas.map(t => t.id),
       },
     }).select('id').single();
@@ -424,6 +441,9 @@ async function verificarPlanoConcluidoEAuditar(projeto_id, plano_id) {
         plano_id,
         tarefas_concluidas: concluidas.length,
       });
+      await notificarChat(projeto_id,
+        `[Sistema] Código gerado. Auditando riscos agora — isso leva alguns segundos.`
+      );
       console.log(`[orchestrator] 🔍 Tarefa de auditoria criada: ${novaTarefa.id}`);
     }
   } catch (err) {
@@ -470,23 +490,22 @@ app.post("/executar", async (req, res) => {
 async function executarCiclo() {
   global.lastCronRun = new Date().toISOString();
   try {
-    // 1. Liberar tarefas travadas há mais de 10 minutos
+    // 1. Liberar tarefas travadas
     const { error: errReset } = await supabase.rpc("resetar_tarefas_travadas");
     if (errReset) console.error("[orchestrator] Falha ao resetar travadas:", errReset.message);
 
-    // 2. Pegar próxima tarefa (lock atômico)
+    // 2. Pegar próxima tarefa
     const { data: tarefas, error: errPegar } = await supabase.rpc("pegar_tarefa");
     if (errPegar) { console.error("[orchestrator] Falha ao pegar tarefa:", errPegar.message); return; }
     if (!tarefas || tarefas.length === 0) { console.log("[orchestrator] Nenhuma tarefa pendente"); return; }
 
-    const tarefa    = tarefas[0];
+    const tarefa     = tarefas[0];
     const tentativas = tarefa.tentativas || 1;
 
     console.log(`[orchestrator] Tarefa: ${tarefa.id} | tipo=${tarefa.tipo_tarefa} | tentativa=${tentativas}/${MAX_RETRY}`);
 
     // 3. Verificar MAX_RETRY
     if (tentativas > MAX_RETRY) {
-      console.error(`[orchestrator] ❌ Tarefa ${tarefa.id} excedeu MAX_RETRY=${MAX_RETRY} — bloqueando`);
       await supabase.from("tarefas")
         .update({ status: "bloqueado", resultado: { erro: "max_retry_atingido", tentativas } })
         .eq("id", tarefa.id);
@@ -502,7 +521,6 @@ async function executarCiclo() {
       .single();
 
     if (!projeto) {
-      console.error("[orchestrator] Projeto não encontrado:", tarefa.projeto_id);
       await supabase.from("tarefas")
         .update({ status: "erro", resultado: { erro: "projeto_nao_encontrado" } })
         .eq("id", tarefa.id);
@@ -515,7 +533,6 @@ async function executarCiclo() {
         .from("tarefas").select("id, status").in("id", tarefa.dependencias);
       const pendentes = (deps || []).filter((d) => d.status !== "concluida");
       if (pendentes.length > 0) {
-        console.log(`[orchestrator] Tarefa ${tarefa.id} aguardando dependências`);
         await supabase.from("tarefas")
           .update({ status: "pendente", em_execucao_por: null, iniciado_em: null })
           .eq("id", tarefa.id);
@@ -535,7 +552,10 @@ async function executarCiclo() {
       return;
     }
 
-    // 7. Tarefas de planejamento — concluir direto sem arquivos
+    // 7. Notificar início da tarefa no chat
+    await notificarChatInicio(projeto.id, tarefa);
+
+    // 8. Tarefas de planejamento — concluir direto
     if (tarefa.tipo_tarefa === "planejamento") {
       await supabase.from("tarefas")
         .update({ status: "concluida", resultado: { aviso: "planejamento_concluido" } })
@@ -546,13 +566,13 @@ async function executarCiclo() {
       return;
     }
 
-    // 8. Tarefa de auditoria — processar via IA direto (sem gerar arquivos)
+    // 9. Tarefa de auditoria — processar via IA direto
     if (tarefa.tipo_tarefa === "auditoria") {
       await processarResultadoAuditoria(projeto, tarefa);
       return;
     }
 
-    // 9. Gerar arquivos via IA se não há arquivos no payload
+    // 10. Gerar arquivos via IA
     let arquivos = tarefa.payload?.arquivos || tarefa.resultado?.arquivos || [];
 
     if (!arquivos.length) {
@@ -561,7 +581,6 @@ async function executarCiclo() {
 
       if (!arquivos || !arquivos.length) {
         const erro = "Executor não gerou arquivos válidos";
-        console.error(`[orchestrator] ❌ ${erro} — tentativa ${tentativas}/${MAX_RETRY}`);
         await inserirLog(tarefa.id, "erro", erro, tentativas);
 
         if (tentativas >= MAX_RETRY) {
@@ -579,7 +598,7 @@ async function executarCiclo() {
       }
     }
 
-    // 10. Aplicar arquivos no disco
+    // 11. Aplicar arquivos no disco
     const nomeProjeto = `lab-${tarefa.projeto_id}`;
     console.log(`[orchestrator] Aplicando ${arquivos.length} arquivo(s) — projeto=${nomeProjeto}`);
 
@@ -601,13 +620,10 @@ async function executarCiclo() {
         arquivos_bloqueados: bloqueados,
       };
     } catch (errExec) {
-      console.error(`[orchestrator] Erro ao aplicar arquivos:`, errExec.message);
       resultadoRunner = { ok: false, aplicado: false, rodando: false, erro: errExec.message };
     }
 
-    console.log(`[orchestrator] Runner resultado: ok=${resultadoRunner.ok} build=${resultadoRunner.build} aplicado=${resultadoRunner.aplicado}`);
-
-    // 11. Processar resultado
+    // 12. Processar resultado
     if (resultadoRunner.ok && resultadoRunner.aplicado) {
       await supabase.from("tarefas").update({
         status: "concluida",
@@ -626,17 +642,19 @@ async function executarCiclo() {
         nomeProjeto,
       });
 
+      const arquivosStr = (resultadoRunner.arquivos_escritos || []).join(", ");
+
       if (resultadoRunner.build === "ok") {
         await inserirEvento(projeto.id, tarefa.id, "execucao_sucesso", { nomeProjeto, build: "ok" });
         await notificarChatConclusao(projeto.id, tarefa,
-          `Tarefa concluída: ${tarefa.payload?.titulo || tarefa.tipo_tarefa}. Build ok. Arquivos: ${(resultadoRunner.arquivos_escritos || []).join(", ")}.`
+          `Pronto — ${arquivosStr} criado com sucesso. Build ok.`
         );
       } else {
         await inserirEvento(projeto.id, tarefa.id, "build_falhou", {
           nomeProjeto, erro: resultadoRunner.build_erro,
         });
         await notificarChatConclusao(projeto.id, tarefa,
-          `Tarefa concluída: ${tarefa.payload?.titulo || tarefa.tipo_tarefa}. Arquivos aplicados mas build falhou. Erro: ${resultadoRunner.build_erro?.substring(0, 200)}.`
+          `Arquivos aplicados (${arquivosStr}) mas o build encontrou um problema. Vou corrigir automaticamente.`
         );
       }
 
@@ -645,7 +663,6 @@ async function executarCiclo() {
 
     } else {
       const erro = resultadoRunner.erro || "Erro desconhecido no runner";
-      console.error(`[orchestrator] ❌ Runner falhou: ${erro} — tentativa ${tentativas}/${MAX_RETRY}`);
       await inserirLog(tarefa.id, "erro", erro, tentativas);
 
       if (tentativas >= MAX_RETRY) {
