@@ -191,10 +191,9 @@ async function gerarCodigoComIA(tarefa, projeto) {
       console.error(`[orchestrator] Executor falhou HTTP ${res.status}:`, JSON.stringify(data).slice(0, 300));
       return [];
     }
-    const output   = data.output || {};
-    const arquivos = Array.isArray(output.arquivos) ? output.arquivos : [];
+    const arquivos = Array.isArray(data.output?.arquivos) ? data.output.arquivos : [];
     console.log(`[orchestrator] Executor retornou ${arquivos.length} arquivo(s)`);
-    if (!arquivos.length) console.warn(`[orchestrator] Output:`, JSON.stringify(output).slice(0, 500));
+    if (!arquivos.length) console.warn(`[orchestrator] Output:`, JSON.stringify(data.output).slice(0, 500));
     return arquivos;
   } catch (err) {
     console.error(`[orchestrator] Erro ao chamar executor:`, err.message);
@@ -279,13 +278,11 @@ async function verificarPlanoConcluidoEAuditar(projeto_id, plano_id) {
     if (concluidas.length === 0) return;
 
     console.log(`[orchestrator] ✅ Plano ${plano_id} concluído — auditoria automática`);
-
     const { data: auditoriaExistente } = await supabase.from('tarefas').select('id')
       .eq('projeto_id', projeto_id).eq('tipo_tarefa', 'auditoria').eq('plano_id', plano_id).limit(1);
     if (auditoriaExistente && auditoriaExistente.length > 0) return;
 
     await supabase.rpc('transicionar_etapa', { p_projeto_id: projeto_id, p_etapa_para: 'auditoria', p_origem: 'orchestrator' });
-
     const { data: novaTarefa } = await supabase.from('tarefas').insert({
       projeto_id, plano_id, tipo_tarefa: 'auditoria', status: 'pendente', prioridade: 5,
       requer_aprovacao: false, ordem_execucao: 999,
@@ -303,7 +300,6 @@ async function verificarPlanoConcluidoEAuditar(projeto_id, plano_id) {
 
 async function processarImportacoesPendentes() {
   try {
-    // Buscar uploads não analisados com projeto vinculado
     const { data: uploads } = await supabase
       .from('uploads')
       .select('id, projeto_id, storage_path, nome_arquivo, tamanho_bytes')
@@ -317,28 +313,27 @@ async function processarImportacoesPendentes() {
     const upload = uploads[0];
     console.log(`[orchestrator] 📦 Processando importação: ${upload.nome_arquivo} (${(upload.tamanho_bytes/1024/1024).toFixed(1)}MB)`);
 
-    // Buscar projeto
     const { data: projeto } = await supabase.from('projetos').select('id, ideia').eq('id', upload.projeto_id).single();
     if (!projeto) return;
 
-    // Notificar chat que análise começou
     await notificarChat(projeto.id, `[Sistema] Iniciando análise do código de ${upload.nome_arquivo}. Isso pode levar até 60 segundos.`);
 
-    // Marcar como em processamento (evitar duplo processamento)
+    // Marcar como em processamento antes de iniciar (evitar duplo processamento)
     await supabase.from('uploads').update({ analisado: true }).eq('id', upload.id);
 
-    // Baixar ZIP do Storage usando service role
+    // Baixar ZIP do Storage
     const { data: zipData, error: errDownload } = await supabase.storage
       .from('uploads-externos')
       .download(upload.storage_path);
 
     if (errDownload || !zipData) {
       console.error('[orchestrator] Erro ao baixar ZIP:', errDownload?.message);
+      await supabase.from('uploads').update({ analisado: false }).eq('id', upload.id);
       await notificarChat(projeto.id, `[Sistema] Não consegui baixar o arquivo para análise. Erro: ${errDownload?.message}`);
       return;
     }
 
-    // Descompactar ZIP em Node.js
+    // Descompactar ZIP
     const AdmZip = require('adm-zip');
     const arrayBuffer = await zipData.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
@@ -351,7 +346,7 @@ async function processarImportacoesPendentes() {
       const entries = zip.getEntries();
       totalArquivos = entries.length;
 
-      const IGNORAR = ["node_modules/", ".git/", "dist/", "build/", ".next/", ".nuxt/", "coverage/", ".cache/"];
+      const IGNORAR     = ["node_modules/", ".git/", "dist/", "build/", ".next/", ".nuxt/", "coverage/", ".cache/"];
       const IGNORAR_EXT = [".lock", ".log", ".map", ".min.js", ".min.css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".zip", ".tar"];
 
       const candidatos = entries.filter(e => {
@@ -360,7 +355,6 @@ async function processarImportacoesPendentes() {
         return !IGNORAR.some(p => c.includes(p)) && !IGNORAR_EXT.some(ext => c.toLowerCase().endsWith(ext));
       });
 
-      // Prioridade igual à edge function original
       const PRIORIDADE = [
         (c) => ["package.json","requirements.txt","go.mod","composer.json"].some(f => c.toLowerCase().endsWith(f)),
         (c) => ["readme.md","readme.txt"].some(f => c.toLowerCase().endsWith(f)),
@@ -390,6 +384,7 @@ async function processarImportacoesPendentes() {
       console.log(`[orchestrator] ZIP: total=${totalArquivos} selecionados=${Object.keys(arquivosSelecionados).length}`);
     } catch (e) {
       console.error('[orchestrator] Erro descompactar ZIP:', e.message);
+      await supabase.from('uploads').update({ analisado: false }).eq('id', upload.id);
       await notificarChat(projeto.id, `[Sistema] Não consegui ler o arquivo ZIP. Verifique se o arquivo não está corrompido.`);
       return;
     }
@@ -424,32 +419,53 @@ async function processarImportacoesPendentes() {
       status_etapa:          'aguardando_aprovacao',
     }).eq('id', projeto.id);
 
-    // Salvar análise no upload
     await supabase.from('uploads').update({ analise }).eq('id', upload.id);
 
-    // Mensagem final no chat com resultado da análise
-    const stackStr     = Array.isArray(analise.stack) ? analise.stack.join(', ') : 'não detectada';
+    // Formatar mensagem de análise em markdown estruturado
+    const stackArr     = Array.isArray(analise.stack) ? analise.stack : [];
     const problemasArr = Array.isArray(analise.problemas_detectados) ? analise.problemas_detectados : [];
     const sugestoesArr = Array.isArray(analise.sugestoes) ? analise.sugestoes : [];
-    const bancoStr     = analise.banco_detectado ? JSON.stringify(analise.banco_detectado) : 'não detectado';
+    const banco        = analise.banco_detectado;
+    const bancoStr     = banco
+      ? `${banco.tipo || 'postgresql'}${Array.isArray(banco.schemas) && banco.schemas.length ? ' — tabelas: ' + banco.schemas.join(', ') : ''}`
+      : 'não detectado';
 
-    const mensagemFinal = [
-      `Análise concluída! Aqui está o que encontrei:`,
+    const linhas = [
+      `## ✅ Análise concluída`,
       ``,
-      `📦 Stack: ${stackStr}`,
-      `🗄️ Banco: ${bancoStr}`,
-      `⚠️ Problemas (${problemasArr.length}): ${problemasArr.slice(0, 3).join(', ') || 'nenhum'}`,
-      `💡 Sugestões (${sugestoesArr.length}): ${sugestoesArr.slice(0, 3).join(', ') || 'nenhuma'}`,
+      `**Stack detectada:**`,
+      ...stackArr.map(s => `- ${s}`),
       ``,
-      `O que você quer fazer primeiro?`,
-    ].join('\n');
+      `**Banco de dados:** ${bancoStr}`,
+    ];
+
+    if (problemasArr.length > 0) {
+      linhas.push(``, `**⚠️ Problemas encontrados (${problemasArr.length}):**`);
+      problemasArr.slice(0, 5).forEach(p => linhas.push(`- ${p}`));
+      if (problemasArr.length > 5) linhas.push(`- *(e mais ${problemasArr.length - 5} outros...)*`);
+    } else {
+      linhas.push(``, `**✅ Nenhum problema crítico encontrado**`);
+    }
+
+    if (sugestoesArr.length > 0) {
+      linhas.push(``, `**💡 Sugestões principais (${sugestoesArr.length}):**`);
+      sugestoesArr.slice(0, 3).forEach(s => linhas.push(`- ${s}`));
+      if (sugestoesArr.length > 3) linhas.push(`- *(e mais ${sugestoesArr.length - 3} sugestões...)*`);
+    }
+
+    linhas.push(``, `O que você quer fazer primeiro?`);
+
+    const mensagemFinal = linhas.join('\n');
 
     await supabase.from('conversas').insert({
       projeto_id: projeto.id, papel: 'lab', mensagem: mensagemFinal,
       etapa: 'aguardando_aprovacao', acao: { tipo: 'analise_concluida' },
     });
 
-    await inserirEvento(projeto.id, null, 'execucao_sucesso', { tipo: 'analise_importacao_concluida', arquivos_analisados: Object.keys(arquivosSelecionados).length });
+    await inserirEvento(projeto.id, null, 'execucao_sucesso', {
+      tipo: 'analise_importacao_concluida',
+      arquivos_analisados: Object.keys(arquivosSelecionados).length,
+    });
 
     console.log(`[orchestrator] ✅ Importação processada: projeto=${projeto.id}`);
 
