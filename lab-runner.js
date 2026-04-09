@@ -296,6 +296,64 @@ async function verificarPlanoConcluidoEAuditar(projeto_id, plano_id) {
   } catch (err) { console.error('[orchestrator] Erro verificar plano:', err.message); }
 }
 
+// ── ROLLBACK AUTOMÁTICO DE IMPORTAÇÕES TRAVADAS ───────────────────────────────
+// Detecta projetos parados em analisando_importacao sem upload pendente na fila.
+// Causa: processar-upload-lovable falhou antes de criar o registro em uploads,
+// deixando o projeto orphan nesse estado indefinidamente.
+// Solução: após TIMEOUT_MINUTOS, volta para aguardando_lovable e avisa o usuário.
+
+async function rollbackImportacoesTravadas() {
+  const TIMEOUT_MINUTOS = 5;
+  try {
+    const limiteData = new Date(Date.now() - TIMEOUT_MINUTOS * 60 * 1000).toISOString();
+
+    const { data: travados } = await supabase
+      .from('projetos')
+      .select('id, ideia')
+      .eq('status_etapa', 'analisando_importacao')
+      .lt('atualizado_em', limiteData);
+
+    if (!travados || travados.length === 0) return;
+
+    for (const projeto of travados) {
+      // Verificar se há upload pendente real — se houver, o Railway vai processar normalmente
+      const { data: uploadsPendentes } = await supabase
+        .from('uploads')
+        .select('id')
+        .eq('projeto_id', projeto.id)
+        .eq('analisado', false)
+        .limit(1);
+
+      if (uploadsPendentes && uploadsPendentes.length > 0) continue; // tem upload na fila — não intervir
+
+      // Sem upload pendente = projeto orphan — rollback
+      console.log(`[orchestrator] ⚠️ Rollback: projeto ${projeto.id} (${projeto.ideia}) travado em analisando_importacao sem upload na fila`);
+
+      await supabase
+        .from('projetos')
+        .update({ status_etapa: 'aguardando_lovable' })
+        .eq('id', projeto.id);
+
+      await supabase.from('conversas').insert({
+        projeto_id: projeto.id,
+        papel: 'lab',
+        mensagem: '⚠️ A análise do ZIP demorou mais que o esperado e foi reiniciada automaticamente. Por favor, faça o upload do ZIP novamente na aba **Upload Lovable**.',
+        etapa: 'aguardando_lovable',
+        acao: { tipo: 'rollback_importacao', agente: 'sistema' },
+      });
+
+      await inserirEvento(projeto.id, null, 'execucao_erro', {
+        tipo: 'rollback_importacao_travada',
+        motivo: 'analisando_importacao sem upload pendente por mais de ' + TIMEOUT_MINUTOS + ' minutos',
+      });
+
+      console.log(`[orchestrator] ✅ Rollback concluído: projeto ${projeto.id} devolvido para aguardando_lovable`);
+    }
+  } catch (err) {
+    console.error('[orchestrator] Erro rollbackImportacoesTravadas:', err.message);
+  }
+}
+
 // ── ANÁLISE DE IMPORTAÇÃO (ZIP grande via Railway) ────────────────────────────
 
 async function processarImportacoesPendentes() {
@@ -501,7 +559,10 @@ app.post("/executar", async (req, res) => {
 async function executarCiclo() {
   global.lastCronRun = new Date().toISOString();
   try {
-    // 0. Processar importações pendentes (ZIP grandes)
+    // 0a. Rollback de projetos travados em analisando_importacao sem upload na fila
+    await rollbackImportacoesTravadas();
+
+    // 0b. Processar importações pendentes (ZIP grandes)
     await processarImportacoesPendentes();
 
     // 1. Liberar tarefas travadas
