@@ -2,6 +2,7 @@ require("dotenv").config();
 const express      = require("express");
 const fs           = require("fs");
 const path         = require("path");
+const sharp        = require("sharp");
 const { execSync } = require("child_process");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -556,6 +557,59 @@ app.post("/executar", async (req, res) => {
 
 // ── CICLO DO ORCHESTRATOR ─────────────────────────────────────────────────────
 
+async function garantirPWA(projetoPath, nomeApp) {
+  try {
+    const publicDir = path.join(projetoPath, 'public');
+    const iconsDir = path.join(publicDir, 'icons');
+    if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+    if (!fs.existsSync(iconsDir)) fs.mkdirSync(iconsDir, { recursive: true });
+
+    const inicial = (nomeApp || 'App').charAt(0).toUpperCase();
+    const svgIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="80" fill="#2563eb"/><text x="256" y="340" font-family="Arial,sans-serif" font-size="280" font-weight="bold" text-anchor="middle" fill="white">${inicial}</text></svg>`;
+    const svgBuffer = Buffer.from(svgIcon);
+
+    const icon192Path = path.join(iconsDir, 'icon-192.png');
+    if (!fs.existsSync(icon192Path)) {
+      await sharp(svgBuffer).resize(192, 192).png().toFile(icon192Path);
+    }
+    const icon512Path = path.join(iconsDir, 'icon-512.png');
+    if (!fs.existsSync(icon512Path)) {
+      await sharp(svgBuffer).resize(512, 512).png().toFile(icon512Path);
+    }
+
+    const manifestPath = path.join(publicDir, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+      const manifest = {
+        name: nomeApp || 'Lab IA App',
+        short_name: (nomeApp || 'App').substring(0, 12),
+        description: `${nomeApp || 'App'} — gerado pelo Laboratório IA`,
+        start_url: '/',
+        display: 'standalone',
+        background_color: '#ffffff',
+        theme_color: '#2563eb',
+        orientation: 'any',
+        icons: [
+          { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+          { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' }
+        ]
+      };
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    }
+
+    const swPath = path.join(publicDir, 'sw.js');
+    if (!fs.existsSync(swPath)) {
+      const sw = `const CACHE='lab-ia-v1';const ASSETS=['/','/index.html'];self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS))));self.addEventListener('fetch',e=>e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request))));`;
+      fs.writeFileSync(swPath, sw);
+    }
+
+    console.log(`[PWA] ✅ ${nomeApp} — manifest, ícones e sw.js garantidos`);
+    return true;
+  } catch (err) {
+    console.error('[PWA] Erro:', err.message);
+    return false;
+  }
+}
+
 async function executarCiclo() {
   global.lastCronRun = new Date().toISOString();
   try {
@@ -686,6 +740,8 @@ async function executarCiclo() {
       const arquivosStr = (resultadoRunner.arquivos_escritos || []).join(", ");
       if (resultadoRunner.build === "ok") {
         await inserirEvento(projeto.id, tarefa.id, "execucao_sucesso", { nomeProjeto, build: "ok" });
+        // Garantir PWA após build ok
+        if (projeto && projetoPath) await garantirPWA(projetoPath, projeto.ideia || 'Lab IA App');
         await notificarChatConclusao(projeto.id, tarefa, `Pronto — ${arquivosStr} criado com sucesso. Build ok.`);
       } else {
         await inserirEvento(projeto.id, tarefa.id, "build_falhou", { nomeProjeto, erro: resultadoRunner.build_erro });
