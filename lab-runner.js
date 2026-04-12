@@ -6,6 +6,9 @@ const sharp        = require("sharp");
 const { execSync } = require("child_process");
 const { createClient } = require("@supabase/supabase-js");
 
+const GITHUB_TOKEN    = process.env.GITHUB_TOKEN    || null;
+const GITHUB_USERNAME = process.env.GITHUB_USERNAME || null;
+
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
@@ -557,6 +560,88 @@ app.post("/executar", async (req, res) => {
 
 // ── CICLO DO ORCHESTRATOR ─────────────────────────────────────────────────────
 
+// ── PUSH PARA GITHUB APÓS BUILD OK ───────────────────────────────────────────
+
+async function pushParaGitHub(projetoPath, projeto) {
+  if (!GITHUB_TOKEN || !GITHUB_USERNAME) {
+    console.log('[GitHub] GITHUB_TOKEN ou GITHUB_USERNAME não configurados — pulando push');
+    return null;
+  }
+
+  const repoName   = `lab-ia-${projeto.id.substring(0, 8)}`;
+  const nomeApp    = (projeto.ideia || 'lab-ia-app')
+    .toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').substring(0, 50);
+  const repoSlug   = `lab-ia-${nomeApp}`;
+  const repoDesc   = `${projeto.ideia || 'Lab IA App'} — gerado automaticamente pelo Laboratório IA`;
+
+  try {
+    // 1. Verificar se o repo já existe via API GitHub
+    const checkRes = await fetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repoSlug}`, {
+      headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, 'User-Agent': 'lab-ia-runner' },
+    });
+
+    // 2. Criar repo se não existir
+    if (checkRes.status === 404) {
+      console.log(`[GitHub] Criando repositório: ${repoSlug}`);
+      const createRes = await fetch('https://api.github.com/user/repos', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${GITHUB_TOKEN}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'lab-ia-runner',
+        },
+        body: JSON.stringify({
+          name: repoSlug, description: repoDesc,
+          private: false, auto_init: false,
+        }),
+      });
+      if (!createRes.ok) {
+        const err = await createRes.json();
+        console.error('[GitHub] Falha ao criar repo:', err.message);
+        return null;
+      }
+      console.log(`[GitHub] ✅ Repositório criado: ${repoSlug}`);
+    }
+
+    // 3. Configurar git e fazer push
+    const remoteUrl = `https://${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${repoSlug}.git`;
+
+    const gitCommands = [
+      `git init`,
+      `git config user.email "lab-ia@runner.auto"`,
+      `git config user.name "Lab IA Runner"`,
+      `git add -A`,
+      `git commit -m "build: deploy automático — Laboratório IA" --allow-empty`,
+      `git branch -M main`,
+      `git remote remove origin 2>/dev/null || true`,
+      `git remote add origin ${remoteUrl}`,
+      `git push -u origin main --force`,
+    ];
+
+    for (const cmd of gitCommands) {
+      try {
+        execSync(cmd, { cwd: projetoPath, stdio: 'pipe', timeout: 30000 });
+      } catch (e) {
+        // Ignorar erros não críticos (ex: remote já existe)
+        if (!cmd.includes('push')) continue;
+        console.error(`[GitHub] Erro no comando git: ${cmd.split(' ').slice(0,2).join(' ')}`, e.message?.slice(0, 200));
+        return null;
+      }
+    }
+
+    const repoUrl = `https://github.com/${GITHUB_USERNAME}/${repoSlug}`;
+    console.log(`[GitHub] ✅ Push concluído: ${repoUrl}`);
+
+    // 4. Salvar URL do repo no projeto
+    await supabase.from('projetos').update({ github_url: repoUrl }).eq('id', projeto.id);
+
+    return repoUrl;
+  } catch (err) {
+    console.error('[GitHub] Erro inesperado:', err.message);
+    return null;
+  }
+}
+
 async function garantirPWA(projetoPath, nomeApp) {
   try {
     const publicDir = path.join(projetoPath, 'public');
@@ -742,7 +827,12 @@ async function executarCiclo() {
         await inserirEvento(projeto.id, tarefa.id, "execucao_sucesso", { nomeProjeto, build: "ok" });
         // Garantir PWA após build ok
         if (projeto && projetoPath) await garantirPWA(projetoPath, projeto.ideia || 'Lab IA App');
-        await notificarChatConclusao(projeto.id, tarefa, `Pronto — ${arquivosStr} criado com sucesso. Build ok.`);
+
+        // Push para GitHub após build ok
+        const githubUrl = await pushParaGitHub(projetoPath, projeto);
+        const githubMsg = githubUrl ? ` Código disponível em: ${githubUrl}` : '';
+
+        await notificarChatConclusao(projeto.id, tarefa, `Pronto — ${arquivosStr} criado com sucesso. Build ok.${githubMsg}`);
       } else {
         await inserirEvento(projeto.id, tarefa.id, "build_falhou", { nomeProjeto, erro: resultadoRunner.build_erro });
         await notificarChatConclusao(projeto.id, tarefa, `Arquivos aplicados (${arquivosStr}) mas o build encontrou um problema. Vou corrigir automaticamente.`);
