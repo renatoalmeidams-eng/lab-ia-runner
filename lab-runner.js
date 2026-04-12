@@ -8,6 +8,7 @@ const { createClient } = require("@supabase/supabase-js");
 
 const GITHUB_TOKEN    = process.env.GITHUB_TOKEN    || null;
 const GITHUB_USERNAME = process.env.GITHUB_USERNAME || null;
+const VERCEL_TOKEN    = process.env.VERCEL_TOKEN    || null;
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -642,6 +643,107 @@ async function pushParaGitHub(projetoPath, projeto) {
   }
 }
 
+
+// ── DEPLOY PARA VERCEL APÓS PUSH GITHUB ──────────────────────────────────────
+
+async function deployParaVercel(repoUrl, projeto) {
+  if (!VERCEL_TOKEN) {
+    console.log('[Vercel] VERCEL_TOKEN não configurado — pulando deploy');
+    return null;
+  }
+  if (!repoUrl) {
+    console.log('[Vercel] Sem URL do GitHub — pulando deploy Vercel');
+    return null;
+  }
+
+  const nomeApp  = (projeto.ideia || 'lab-ia-app')
+    .toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').substring(0, 50);
+  const repoSlug = `lab-ia-${nomeApp}`;
+
+  try {
+    // 1. Verificar se projeto Vercel já existe
+    const listRes = await fetch(`https://api.vercel.com/v9/projects/${repoSlug}`, {
+      headers: { Authorization: `Bearer ${VERCEL_TOKEN}` },
+    });
+
+    let vercelProjectId = null;
+
+    if (listRes.status === 404) {
+      // 2. Criar projeto Vercel linkado ao repo GitHub
+      console.log(`[Vercel] Criando projeto: ${repoSlug}`);
+      const createRes = await fetch('https://api.vercel.com/v10/projects', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${VERCEL_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: repoSlug,
+          framework: 'vite',
+          gitRepository: {
+            type: 'github',
+            repo: `${GITHUB_USERNAME}/${repoSlug}`,
+          },
+          buildCommand: 'npm run build',
+          outputDirectory: 'dist',
+          installCommand: 'npm install',
+        }),
+      });
+
+      if (!createRes.ok) {
+        const err = await createRes.json();
+        console.error('[Vercel] Falha ao criar projeto:', JSON.stringify(err).slice(0, 200));
+        return null;
+      }
+
+      const created = await createRes.json();
+      vercelProjectId = created.id;
+      console.log(`[Vercel] ✅ Projeto criado: ${repoSlug} (id=${vercelProjectId})`);
+    } else {
+      const existing = await listRes.json();
+      vercelProjectId = existing.id;
+      console.log(`[Vercel] Projeto já existe: ${repoSlug} (id=${vercelProjectId})`);
+    }
+
+    // 3. Disparar deploy via API
+    const deployRes = await fetch('https://api.vercel.com/v13/deployments', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${VERCEL_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: repoSlug,
+        project: vercelProjectId,
+        gitSource: {
+          type: 'github',
+          repoId: `${GITHUB_USERNAME}/${repoSlug}`,
+          ref: 'main',
+        },
+        target: 'production',
+      }),
+    });
+
+    if (!deployRes.ok) {
+      const err = await deployRes.json();
+      console.error('[Vercel] Falha ao criar deploy:', JSON.stringify(err).slice(0, 200));
+      return null;
+    }
+
+    const deploy = await deployRes.json();
+    const vercelUrl = `https://${deploy.url || `${repoSlug}.vercel.app`}`;
+    console.log(`[Vercel] ✅ Deploy iniciado: ${vercelUrl}`);
+
+    // 4. Salvar URL Vercel no projeto
+    await supabase.from('projetos').update({ vercel_url: vercelUrl }).eq('id', projeto.id);
+
+    return vercelUrl;
+  } catch (err) {
+    console.error('[Vercel] Erro inesperado:', err.message);
+    return null;
+  }
+}
+
 async function garantirPWA(projetoPath, nomeApp) {
   try {
     const publicDir = path.join(projetoPath, 'public');
@@ -830,9 +932,15 @@ async function executarCiclo() {
 
         // Push para GitHub após build ok
         const githubUrl = await pushParaGitHub(projetoPath, projeto);
-        const githubMsg = githubUrl ? ` Código disponível em: ${githubUrl}` : '';
 
-        await notificarChatConclusao(projeto.id, tarefa, `Pronto — ${arquivosStr} criado com sucesso. Build ok.${githubMsg}`);
+        // Deploy para Vercel após push GitHub
+        const vercelUrl = await deployParaVercel(githubUrl, projeto);
+
+        // Montar mensagem final com links
+        const githubMsg = githubUrl ? ` GitHub: ${githubUrl}` : '';
+        const vercelMsg = vercelUrl ? ` | App: ${vercelUrl}` : '';
+
+        await notificarChatConclusao(projeto.id, tarefa, `Pronto — ${arquivosStr} criado com sucesso. Build ok.${githubMsg}${vercelMsg}`);
       } else {
         await inserirEvento(projeto.id, tarefa.id, "build_falhou", { nomeProjeto, erro: resultadoRunner.build_erro });
         await notificarChatConclusao(projeto.id, tarefa, `Arquivos aplicados (${arquivosStr}) mas o build encontrou um problema. Vou corrigir automaticamente.`);
