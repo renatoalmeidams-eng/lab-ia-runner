@@ -172,6 +172,71 @@ async function notificarChatConclusao(projeto_id, tarefa, resumo) {
   await notificarChat(projeto_id, `[Sistema] ${resumo}`);
 }
 
+// ── EDIÇÃO INCREMENTAL ───────────────────────────────────────────────────────
+// Lê os arquivos relevantes do projeto já no disco e passa como contexto
+// para o executor. Isso evita que o executor gere imports para arquivos
+// que não existem ou reescreva arquivos desnecessariamente.
+
+function lerArquivosExistentes(projetoPath, maxArquivos = 20) {
+  const resultado = [];
+  const EXTENSOES = ['.jsx', '.tsx', '.js', '.ts', '.css', '.html', '.json'];
+  const IGNORAR   = ['node_modules', '.git', 'dist', '.cache', 'coverage'];
+
+  function coletar(dir, base = '') {
+    if (resultado.length >= maxArquivos) return;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      // Ordenar: arquivos primeiro, depois pastas — priorizando raiz e src/
+      entries.sort((a, b) => {
+        if (a.isFile() && b.isDirectory()) return -1;
+        if (a.isDirectory() && b.isFile()) return 1;
+        return a.name.localeCompare(b.name);
+      });
+      for (const e of entries) {
+        if (resultado.length >= maxArquivos) break;
+        const rel = base ? `${base}/${e.name}` : e.name;
+        if (e.isDirectory()) {
+          if (!IGNORAR.includes(e.name)) coletar(path.join(dir, e.name), rel);
+        } else {
+          const ext = path.extname(e.name).toLowerCase();
+          if (!EXTENSOES.includes(ext)) continue;
+          // Ignorar arquivos muito grandes (> 15KB)
+          const fullPath = path.join(dir, e.name);
+          try {
+            const stat = fs.statSync(fullPath);
+            if (stat.size > 15000) continue;
+            const conteudo = fs.readFileSync(fullPath, 'utf-8');
+            resultado.push({ caminho: rel, conteudo });
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  if (fs.existsSync(projetoPath)) coletar(projetoPath);
+  return resultado;
+}
+
+function analisarImpacto(tarefa, arquivosExistentes) {
+  // Identifica quais arquivos existentes são relevantes para a tarefa
+  // baseado no título e descrição — sem chamar IA
+  const titulo    = (tarefa.payload?.titulo    || '').toLowerCase();
+  const descricao = (tarefa.payload?.descricao || '').toLowerCase();
+  const texto     = `${titulo} ${descricao}`;
+
+  return arquivosExistentes.filter(a => {
+    const nome = a.caminho.toLowerCase();
+    // Sempre incluir arquivos de entrada (App, main, index)
+    if (/\/(app|main|index)\.[jt]sx?$/.test(nome)) return true;
+    // Incluir se o nome do arquivo aparece na descrição da tarefa
+    const baseName = path.basename(nome, path.extname(nome)).toLowerCase();
+    if (baseName.length > 3 && texto.includes(baseName)) return true;
+    // Incluir package.json para contexto de dependências
+    if (nome === 'package.json') return true;
+    return false;
+  }).slice(0, 10); // máximo 10 arquivos relevantes
+}
+
 async function gerarCodigoComIA(tarefa, projeto) {
   try {
     // ── OODA: Observe → Orient → Decide ─────────────────────────────────────
@@ -195,6 +260,16 @@ async function gerarCodigoComIA(tarefa, projeto) {
 ${decide.instrucao}`
       : descricaoBase;
 
+    // ── EDIÇÃO INCREMENTAL: ler arquivos existentes no disco ───────────────
+    const nomeProjeto   = `lab-${tarefa.projeto_id}`;
+    const projetoPath   = path.join(BASE_PATH, nomeProjeto);
+    const todosArquivos = lerArquivosExistentes(projetoPath);
+    const arquivosRel   = analisarImpacto(tarefa, todosArquivos);
+
+    if (arquivosRel.length > 0) {
+      console.log(`[Incremental] ${arquivosRel.length} arquivo(s) relevante(s) passados ao executor: ${arquivosRel.map(a => a.caminho).join(', ')}`);
+    }
+
     // ── Chamar executor IA ───────────────────────────────────────────────────
     console.log(`[orchestrator] Chamando executor IA — tarefa=${tarefa.id}`);
     const res = await fetch(`${SUPABASE_URL}/functions/v1/executar-agente`, {
@@ -210,6 +285,10 @@ ${decide.instrucao}`
           banco:              projeto?.banco_externo      || null,
           arquivos_esperados: tarefa.payload?.arquivos_esperados || [],
           complexidade:       tarefa.payload?.complexidade || "media",
+          arquivos_existentes: arquivosRel.map(a => ({
+            caminho:  a.caminho,
+            conteudo: a.conteudo.slice(0, 3000), // limitar por arquivo para não explodir o contexto
+          })),
         },
       }),
     });
