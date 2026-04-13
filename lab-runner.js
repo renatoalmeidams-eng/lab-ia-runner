@@ -174,6 +174,28 @@ async function notificarChatConclusao(projeto_id, tarefa, resumo) {
 
 async function gerarCodigoComIA(tarefa, projeto) {
   try {
+    // ── OODA: Observe → Orient → Decide ─────────────────────────────────────
+    const obs    = await oodaObserve(tarefa, projeto);
+    const orient = await oodaOrient(obs);
+    const decide = oodaDecide(obs, orient);
+
+    console.log(`[OODA] risco=${orient.risco} decisao=${decide.decisao} tentativa=${obs.tentativas}`);
+
+    // Se decisão for escalar, retornar vazio para o orchestrator tratar como erro
+    if (decide.decisao === 'escalar') {
+      console.error(`[OODA] Escalando — ${obs.tentativas} tentativas sem sucesso`);
+      return [];
+    }
+
+    // Montar descrição enriquecida com instrução OODA se necessário
+    const descricaoBase = tarefa.payload?.descricao || "";
+    const descricaoFinal = decide.instrucao
+      ? `${descricaoBase}
+
+${decide.instrucao}`
+      : descricaoBase;
+
+    // ── Chamar executor IA ───────────────────────────────────────────────────
     console.log(`[orchestrator] Chamando executor IA — tarefa=${tarefa.id}`);
     const res = await fetch(`${SUPABASE_URL}/functions/v1/executar-agente`, {
       method: "POST",
@@ -182,7 +204,7 @@ async function gerarCodigoComIA(tarefa, projeto) {
         agente: "executor", projeto_id: tarefa.projeto_id, tarefa_id: tarefa.id,
         input: {
           titulo:             tarefa.payload?.titulo      || tarefa.tipo_tarefa,
-          descricao:          tarefa.payload?.descricao   || "",
+          descricao:          descricaoFinal,
           stack:              tarefa.payload?.stack       || projeto?.stack_detectada || "React + Vite (frontend)",
           dependencias:       tarefa.payload?.dependencias || [],
           banco:              projeto?.banco_externo      || null,
@@ -204,6 +226,179 @@ async function gerarCodigoComIA(tarefa, projeto) {
     console.error(`[orchestrator] Erro ao chamar executor:`, err.message);
     return [];
   }
+}
+
+// ── VALIDADORES ESTRUTURAIS (sem IA) ─────────────────────────────────────────
+// Verifica problemas óbvios nos arquivos gerados antes de tentar o build.
+// Detecta imports quebrados, referências a arquivos inexistentes, etc.
+// Roda ANTES do build — evita chamar IA para corrigir erros simples.
+
+function validarArquivosGerados(arquivos, projetoPath) {
+  const problemas = [];
+  const caminhos = new Set(arquivos.map(a => (a.caminho || a.path || '').replace(/\\/g, '/')));
+
+  // Adicionar arquivos já existentes no disco ao conjunto
+  function coletarArquivosExistentes(dir, base = '') {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const e of entries) {
+        const rel = base ? `${base}/${e.name}` : e.name;
+        if (e.isDirectory()) {
+          if (!['node_modules', '.git', 'dist'].includes(e.name)) coletarArquivosExistentes(path.join(dir, e.name), rel);
+        } else {
+          caminhos.add(rel);
+        }
+      }
+    } catch {}
+  }
+  if (projetoPath && fs.existsSync(projetoPath)) coletarArquivosExistentes(projetoPath);
+
+  for (const arquivo of arquivos) {
+    const caminho = (arquivo.caminho || arquivo.path || '');
+    const codigo  = (arquivo.codigo  || arquivo.content || '');
+    const ext     = path.extname(caminho).toLowerCase();
+
+    if (!['.js', '.jsx', '.ts', '.tsx'].includes(ext)) continue;
+
+    // Verificar imports relativos
+    const importRegex = /(?:import|from|require)\s*[\(]?\s*['"](\.{1,2}\/[^'"]+)['"]/g;
+    let match;
+    while ((match = importRegex.exec(codigo)) !== null) {
+      const importPath = match[1];
+      const dir        = path.dirname(caminho);
+      const resolved   = path.join(dir, importPath).replace(/\\/g, '/');
+
+      // Checar se existe com ou sem extensão
+      const extensoes = ['', '.js', '.jsx', '.ts', '.tsx', '/index.js', '/index.jsx', '/index.ts', '/index.tsx'];
+      const existe = extensoes.some(ext => caminhos.has(resolved + ext) || caminhos.has(resolved.replace(/^\.\//,'') + ext));
+
+      if (!existe) {
+        problemas.push({
+          arquivo: caminho,
+          tipo: 'import_quebrado',
+          detalhe: `Import '${importPath}' não encontrado — arquivo inexistente no projeto`,
+          import: importPath,
+          resolvido: resolved,
+        });
+      }
+    }
+  }
+
+  return problemas;
+}
+
+// ── OODA PROTOCOL ─────────────────────────────────────────────────────────────
+// Observe → Orient → Decide → Act
+// Executado antes de cada chamada ao executor IA.
+// Orient usa Claude Haiku (barato) para análise de risco.
+// Decide é determinístico — sem IA.
+
+async function oodaObserve(tarefa, projeto) {
+  // Buscar tentativas e erros anteriores desta tarefa
+  const { data: logs } = await supabase
+    .from('logs_execucao')
+    .select('status, resultado, criado_em')
+    .eq('tarefa_id', tarefa.id)
+    .order('criado_em', { ascending: false })
+    .limit(5);
+
+  const errosAnteriores = (logs || [])
+    .filter(l => l.status === 'erro')
+    .map(l => typeof l.resultado === 'string' ? l.resultado : JSON.stringify(l.resultado || ''))
+    .filter(Boolean)
+    .slice(0, 3);
+
+  return {
+    tarefa_id:           tarefa.id,
+    tipo_tarefa:         tarefa.tipo_tarefa,
+    tentativas:          tarefa.tentativas || 1,
+    erros_anteriores:    errosAnteriores,
+    tem_erros:           errosAnteriores.length > 0,
+    projeto_origem:      projeto.origem || 'lab',
+    stack:               projeto.stack_detectada || 'React + Vite',
+  };
+}
+
+async function oodaOrient(obs) {
+  // Risco determinístico — sem chamar IA para casos simples
+  if (!obs.tem_erros && obs.tentativas <= 1) {
+    return { risco: 'baixo', estrategia: 'Executar normalmente', custo_tokens: 0 };
+  }
+
+  // Usar Claude Haiku para análise de risco quando há erros anteriores
+  try {
+    const prompt = `Analise o contexto e retorne JSON de risco.
+
+CONTEXTO:
+- Tipo tarefa: ${obs.tipo_tarefa}
+- Tentativa: ${obs.tentativas}
+- Erros anteriores: ${obs.erros_anteriores.length > 0 ? obs.erros_anteriores.join(' | ') : 'nenhum'}
+- Stack: ${obs.stack}
+
+Retorne APENAS este JSON sem markdown:
+{"risco":"baixo"|"medio"|"alto"|"critico","estrategia":"instrução curta para o executor evitar o erro anterior"}
+
+Critérios: baixo=sem erros; medio=1 erro; alto=2+ erros ou import quebrado; critico=3+ erros ou mesmo erro repetido`;
+
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 256,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!res.ok) throw new Error(`Haiku HTTP ${res.status}`);
+    const data = await res.json();
+    const texto = data.content?.[0]?.text || '{}';
+    const parsed = JSON.parse(texto.replace(/```json|```/g, '').trim());
+
+    return {
+      risco:        parsed.risco     || 'baixo',
+      estrategia:   parsed.estrategia || 'Executar normalmente',
+      custo_tokens: (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0),
+    };
+  } catch (err) {
+    console.warn('[OODA] Orient falhou — usando fallback determinístico:', err.message);
+    // Fallback determinístico se Haiku falhar
+    const risco = obs.tentativas >= 3 ? 'critico' : obs.tentativas === 2 ? 'alto' : obs.tem_erros ? 'medio' : 'baixo';
+    return { risco, estrategia: 'Ser mais cuidadoso com imports e referências', custo_tokens: 0 };
+  }
+}
+
+function oodaDecide(obs, orient) {
+  // Decisões determinísticas — sem IA
+
+  // Critico: 3+ tentativas com erros → escalar
+  if (orient.risco === 'critico' && obs.tentativas >= 3) {
+    return { decisao: 'escalar', instrucao: null };
+  }
+
+  // Alto: ajustar prompt com contexto dos erros
+  if (orient.risco === 'alto' || obs.erros_anteriores.length >= 2) {
+    const ultimoErro = obs.erros_anteriores[0] || '';
+    return {
+      decisao: 'ajustar_prompt',
+      instrucao: `ATENÇÃO — tentativa ${obs.tentativas}: ${orient.estrategia}. Último erro: ${ultimoErro.slice(0, 200)}. Verifique todos os imports antes de retornar.`,
+    };
+  }
+
+  // Medio: ajuste leve
+  if (orient.risco === 'medio') {
+    return {
+      decisao: 'ajustar_prompt',
+      instrucao: `Nota: ${orient.estrategia}`,
+    };
+  }
+
+  // Baixo: executar normalmente
+  return { decisao: 'executar_normal', instrucao: null };
 }
 
 async function processarResultadoAuditoria(projeto, tarefa) {
@@ -893,6 +1088,23 @@ async function executarCiclo() {
     // 11. Aplicar arquivos
     const nomeProjeto = `lab-${tarefa.projeto_id}`;
     console.log(`[orchestrator] Aplicando ${arquivos.length} arquivo(s) — ${nomeProjeto}`);
+
+    // ── VALIDADORES ESTRUTURAIS (antes do build, sem IA) ────────────────────
+    const projetoPathTemp = path.join(BASE_PATH, nomeProjeto);
+    const problemas = validarArquivosGerados(arquivos, projetoPathTemp);
+    if (problemas.length > 0) {
+      console.warn(`[Validador] ⚠️ ${problemas.length} problema(s) detectado(s) antes do build:`);
+      problemas.forEach(p => console.warn(`  - ${p.arquivo}: ${p.detalhe}`));
+      // Não bloquear — apenas logar. O executor pode ter gerado corretamente.
+      // Se build falhar, o OODA vai usar esses erros na próxima tentativa.
+      await inserirEvento(projeto.id, tarefa.id, 'execucao_erro', {
+        tipo: 'validacao_pre_build',
+        problemas: problemas.slice(0, 10),
+        total: problemas.length,
+      });
+    } else {
+      console.log(`[Validador] ✅ Nenhum problema estrutural detectado`);
+    }
 
     let resultadoRunner;
     try {
