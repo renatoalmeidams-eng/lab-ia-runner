@@ -459,6 +459,8 @@ async function processarResultadoAuditoria(projeto, tarefa) {
       await supabase.rpc('transicionar_etapa', { p_projeto_id: projeto.id, p_etapa_para: 'revisao', p_origem: 'auditoria_automatica' });
       await inserirEvento(projeto.id, tarefa.id, 'execucao_sucesso', { tipo: 'auditoria_aprovada', resumo: output.resumo_auditoria, total_riscos: riscos.length });
       await notificarChatConclusao(projeto.id, tarefa, `Auditoria concluída sem riscos críticos. ${output.resumo_auditoria || ''}`);
+      // Otimizador — aprende com o projeto concluído
+      executarOtimizador(projeto.id).catch(e => console.warn('[Otimizador] Erro silencioso:', e.message));
     }
   } catch (err) {
     console.error('[orchestrator] Erro auditoria:', err.message);
@@ -936,6 +938,125 @@ async function deployParaVercel(repoUrl, projeto) {
   } catch (err) {
     console.error('[Vercel] Erro inesperado:', err.message);
     return null;
+  }
+}
+
+// ── OTIMIZADOR ───────────────────────────────────────────────────────────────
+// Roda após transição para revisao. Analisa o histórico do projeto e salva
+// aprendizados na tabela aprendizados para evoluir o sistema automaticamente.
+
+async function executarOtimizador(projeto_id) {
+  try {
+    console.log(`[Otimizador] Iniciando análise — projeto=${projeto_id}`);
+
+    // 1. Coletar dados do projeto
+    const { data: projeto } = await supabase
+      .from('projetos')
+      .select('id, ideia, stack_detectada, banco_externo, origem')
+      .eq('id', projeto_id).single();
+
+    if (!projeto) return;
+
+    // 2. Coletar tarefas concluídas e bloqueadas
+    const { data: tarefas } = await supabase
+      .from('tarefas')
+      .select('id, tipo_tarefa, status, tentativas, payload, resultado')
+      .eq('projeto_id', projeto_id)
+      .in('status', ['concluida', 'bloqueado'])
+      .order('criado_em', { ascending: true });
+
+    // 3. Coletar eventos relevantes
+    const { data: eventos } = await supabase
+      .from('eventos')
+      .select('tipo, payload, criado_em')
+      .eq('projeto_id', projeto_id)
+      .in('tipo', ['build_falhou', 'tarefa_bloqueada', 'execucao_sucesso', 'auditoria_aprovada'])
+      .order('criado_em', { ascending: true });
+
+    const totalTarefas   = (tarefas || []).length;
+    const tarefasBloq    = (tarefas || []).filter(t => t.status === 'bloqueado').length;
+    const buildsFalhou   = (eventos || []).filter(e => e.tipo === 'build_falhou').length;
+    const buildsOk       = (tarefas || []).filter(t => t.resultado?.build === 'ok').length;
+
+    // Só rodar se houver algo interessante para aprender
+    if (totalTarefas < 3) {
+      console.log(`[Otimizador] Projeto com poucos dados (${totalTarefas} tarefas) — pulando`);
+      return;
+    }
+
+    // 4. Montar input para o agente otimizador
+    const input = {
+      projeto: {
+        id:      projeto.id,
+        ideia:   projeto.ideia,
+        stack:   projeto.stack_detectada,
+        origem:  projeto.origem,
+      },
+      estatisticas: {
+        total_tarefas:   totalTarefas,
+        tarefas_ok:      totalTarefas - tarefasBloq,
+        tarefas_bloq:    tarefasBloq,
+        builds_ok:       buildsOk,
+        builds_falhou:   buildsFalhou,
+        taxa_sucesso:    `${Math.round(((totalTarefas - tarefasBloq) / totalTarefas) * 100)}%`,
+      },
+      erros_mais_comuns: (tarefas || [])
+        .filter(t => t.status === 'bloqueado')
+        .map(t => ({
+          tipo: t.tipo_tarefa,
+          tentativas: t.tentativas,
+          erro: t.resultado?.erro || 'desconhecido',
+        }))
+        .slice(0, 5),
+      builds_falhou_detalhes: (eventos || [])
+        .filter(e => e.tipo === 'build_falhou')
+        .map(e => e.payload?.erro || '')
+        .filter(Boolean)
+        .slice(0, 3),
+    };
+
+    // 5. Chamar agente otimizador via executar-agente
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/executar-agente`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_KEY}` },
+      body: JSON.stringify({ agente: 'otimizador', projeto_id, input }),
+    });
+
+    if (!res.ok) {
+      console.warn(`[Otimizador] executar-agente falhou HTTP ${res.status}`);
+      return;
+    }
+
+    const data = await res.json();
+    const output = data.output || {};
+    const aprendizados = Array.isArray(output.aprendizados) ? output.aprendizados : [];
+
+    if (!aprendizados.length) {
+      console.log(`[Otimizador] Nenhum aprendizado identificado`);
+      return;
+    }
+
+    // 6. Salvar aprendizados no banco
+    const rows = aprendizados.map(a => ({
+      projeto_id,
+      tipo:             a.tipo             || 'padrao_falha',
+      agente:           a.agente           || 'executor',
+      titulo:           a.titulo           || 'Aprendizado',
+      descricao:        a.descricao        || '',
+      contexto:         { instrucao_prompt: a.instrucao_prompt || null, stack: projeto.stack_detectada },
+      impacto_estimado: a.impacto_estimado || 'medio',
+      aplicado:         false,
+    }));
+
+    await supabase.from('aprendizados').insert(rows);
+
+    console.log(`[Otimizador] ✅ ${aprendizados.length} aprendizado(s) salvos — ${output.resumo || ''}`);
+
+    // 7. Notificar chat com resumo
+    await notificarChat(projeto_id, `[Sistema] 🧠 Otimizador identificou ${aprendizados.length} aprendizado(s) com este projeto. ${output.resumo || ''}`);
+
+  } catch (err) {
+    console.error('[Otimizador] Erro:', err.message);
   }
 }
 
